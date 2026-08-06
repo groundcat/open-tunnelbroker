@@ -95,7 +95,7 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel)
 			return nil, fmt.Errorf("tunnel %d public key: %w", t.ID, e)
 		}
 		pc := wgtypes.PeerConfig{PublicKey: pub, ReplaceAllowedIPs: true, AllowedIPs: []net.IPNet{*prefixIPNet(netip.MustParsePrefix(t.V6CIDR))}}
-		if t.V4Enabled && t.V4Address != "" {
+		if tunnelIPv4Enabled(cfg, t) {
 			a := netip.MustParseAddr(t.V4Address)
 			pc.AllowedIPs = append(pc.AllowedIPs, *prefixIPNet(netip.PrefixFrom(a, 32)))
 		}
@@ -127,18 +127,23 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel)
 	}
 	for i, t := range tunnels {
 		p := netip.MustParsePrefix(t.V6CIDR)
-		routes := []*netlink.Route{{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(p), Protocol: 0x42}}
+		v6Route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(p), Protocol: 0x42}
+		if t.Enabled {
+			if err = netlink.RouteReplace(v6Route); err != nil {
+				return nil, err
+			}
+		} else {
+			_ = netlink.RouteDel(v6Route)
+		}
 		if t.V4Enabled && t.V4Address != "" {
 			a := netip.MustParseAddr(t.V4Address)
-			routes = append(routes, &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.PrefixFrom(a, 32)), Protocol: 0x42})
-		}
-		for _, route := range routes {
-			if t.Enabled {
-				if err = netlink.RouteReplace(route); err != nil {
+			v4Route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.PrefixFrom(a, 32)), Protocol: 0x42}
+			if t.Enabled && tunnelIPv4Enabled(cfg, t) {
+				if err = netlink.RouteReplace(v4Route); err != nil {
 					return nil, err
 				}
 			} else {
-				_ = netlink.RouteDel(route)
+				_ = netlink.RouteDel(v4Route)
 			}
 		}
 		for _, live := range dev.Peers {
@@ -196,7 +201,7 @@ func (k *LinuxKernel) Inspect(cfg Settings, tunnels []Tunnel) ([]string, error) 
 			continue
 		}
 		expected := map[string]bool{netip.MustParsePrefix(t.V6CIDR).String(): true}
-		if t.V4Enabled && t.V4Address != "" {
+		if tunnelIPv4Enabled(cfg, t) {
 			expected[t.V4Address+"/32"] = true
 		}
 		if len(peer.AllowedIPs) != len(expected) {
@@ -227,7 +232,7 @@ func (k *LinuxKernel) Inspect(cfg Settings, tunnels []Tunnel) ([]string, error) 
 		if !liveRoutes[netip.MustParsePrefix(t.V6CIDR).String()] {
 			drift = append(drift, fmt.Sprintf("tunnel %d IPv6 route is missing", t.ID))
 		}
-		if t.V4Enabled && t.V4Address != "" && !liveRoutes[t.V4Address+"/32"] {
+		if tunnelIPv4Enabled(cfg, t) && !liveRoutes[t.V4Address+"/32"] {
 			drift = append(drift, fmt.Sprintf("tunnel %d IPv4 route is missing", t.ID))
 		}
 	}

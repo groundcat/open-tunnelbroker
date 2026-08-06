@@ -37,3 +37,7 @@ type Health struct {
 	LastReconcile time.Time
 	Error         string
 }
+
+func tunnelIPv4Enabled(cfg Settings, tunnel Tunnel) bool {
+	return cfg.V4NAT && tunnel.V4Enabled && tunnel.V4Address != ""
+}

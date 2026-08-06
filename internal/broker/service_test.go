@@ -1,10 +1,13 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,6 +79,48 @@ func TestClientConfigFormatsIPv6EndpointAndSingleAddress(t *testing.T) {
 	generated := a.ClientConfig(tunnel, cfg)
 	if !containsAll(generated, "Address = 2001:db8:1200::9/128", "Endpoint = [2001:db8::10]:51820") {
 		t.Fatalf("bad client config: %s", generated)
+	}
+}
+
+func TestClientConfigGlobalNATToggleControlsIPv4(t *testing.T) {
+	a, _ := testApp(t)
+	cfg := mustSettings(t, a)
+	tunnel := Tunnel{V6CIDR: "2001:db8:1200:100::/56", V4Enabled: true, V4Address: "10.99.0.2"}
+
+	cfg.V4NAT = false
+	v6Only := a.ClientConfig(tunnel, cfg)
+	if strings.Contains(v6Only, "10.99.0.2") || strings.Contains(v6Only, "0.0.0.0/0") || !strings.Contains(v6Only, "AllowedIPs = ::/0") {
+		t.Fatalf("IPv4 leaked into config while global NAT was disabled: %s", v6Only)
+	}
+
+	cfg.V4NAT = true
+	dualStack := a.ClientConfig(tunnel, cfg)
+	if !containsAll(dualStack, "10.99.0.2/32", "AllowedIPs = 0.0.0.0/0, ::/0") {
+		t.Fatalf("IPv4 missing while NAT was enabled: %s", dualStack)
+	}
+}
+
+func TestTunnelQRCodeIsSensitivePNG(t *testing.T) {
+	a, _ := testApp(t)
+	tunnel := Tunnel{ID: 7, Label: "QR test", PrivateKey: "private-key", PresharedKey: "preshared-key", V6CIDR: "2001:db8:1200:100::/56"}
+	recorder := httptest.NewRecorder()
+	a.tunnelQRCode(recorder, tunnel)
+	result := recorder.Result()
+	defer result.Body.Close()
+	if result.StatusCode != http.StatusOK || result.Header.Get("Content-Type") != "image/png" || result.Header.Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("unexpected QR response: status=%d headers=%v", result.StatusCode, result.Header)
+	}
+	if !bytes.HasPrefix(recorder.Body.Bytes(), []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("QR response is not a PNG")
+	}
+}
+
+func TestTunnelQRCodeRequiresServerGeneratedPrivateKey(t *testing.T) {
+	a, _ := testApp(t)
+	recorder := httptest.NewRecorder()
+	a.tunnelQRCode(recorder, Tunnel{ID: 8, V6CIDR: "2001:db8:1200:200::/56"})
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d", recorder.Code)
 	}
 }
 

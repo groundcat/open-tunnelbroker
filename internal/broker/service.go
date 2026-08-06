@@ -277,11 +277,11 @@ func (a *App) ClientConfig(t Tunnel, cfg Settings) string {
 		dns = cfg.DefaultDNS
 	}
 	address := firstUsable(netip.MustParsePrefix(t.V6CIDR)).String() + "/" + fmt.Sprint(netip.MustParsePrefix(t.V6CIDR).Bits())
-	if t.V4Enabled {
+	if tunnelIPv4Enabled(cfg, t) {
 		address += ", " + t.V4Address + "/32"
 	}
 	allowed := "::/0"
-	if t.V4Enabled {
+	if tunnelIPv4Enabled(cfg, t) {
 		allowed = "0.0.0.0/0, ::/0"
 	}
 	pub := ""

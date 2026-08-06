@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 type view struct {
@@ -211,6 +213,14 @@ func (a *App) tunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, e.Error(), 500)
 		return
 	}
+	if len(parts) > 1 {
+		if len(parts) != 2 || parts[1] != "qr.png" || r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		a.tunnelQRCode(w, t)
+		return
+	}
 	v := a.base(r)
 	if r.Method == "POST" {
 		if !a.checkCSRF(r) {
@@ -244,6 +254,27 @@ func (a *App) tunnel(w http.ResponseWriter, r *http.Request) {
 		v.Notice = "Tunnel created and applied"
 	}
 	a.render(w, "detail", v)
+}
+func (a *App) tunnelQRCode(w http.ResponseWriter, tunnel Tunnel) {
+	if tunnel.PrivateKey == "" {
+		http.Error(w, "QR code unavailable for a client-managed private key", http.StatusConflict)
+		return
+	}
+	cfg, err := a.store.Settings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	png, err := qrcode.Encode(a.ClientConfig(tunnel, cfg), qrcode.Medium, 320)
+	if err != nil {
+		http.Error(w, "could not generate QR code", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="tunnel-%d.png"`, tunnel.ID))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(png)
 }
 func (a *App) resync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" || !a.checkCSRF(r) {
@@ -285,4 +316,4 @@ const pageHTML = `{{define "head"}}<!doctype html><html lang="en"><head><meta ch
 {{define "dashboard"}}{{template "head" .}}{{if not .Settings.UpstreamV6}}<p class="error">Configure the upstream prefix before creating tunnels.</p>{{end}}<div class="row"><div><h2>Pool</h2><p>Upstream: {{.Settings.UpstreamV6}}<br>/64 units allocated: {{.Allocated}}<br>Largest available block: {{if ge .Largest 0}}/{{.Largest}}{{else}}none{{end}}</p></div><div><h2>Reconciliation</h2><p>Last: {{since .Health.LastReconcile}}<br>{{if .Health.Error}}<span class="bad">{{.Health.Error}}</span>{{else}}No apply error{{end}}<br>{{if .Health.Drift}}<span class="bad">Drift remains: {{range .Health.Drift}}{{.}}; {{end}}</span>{{else}}Kernel matches database{{end}}</p><form method="post" action="/resync"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Resync now</button></form></div></div><h2>Tunnels</h2><table><thead><tr><th>Name</th><th>IPv6</th><th>IPv4</th><th>Status</th><th>Last handshake</th><th>Traffic</th></tr></thead><tbody>{{range .Tunnels}}<tr><td><a href="/tunnels/{{.ID}}">{{.Label}}</a></td><td>{{.V6CIDR}}</td><td>{{.V4Address}}</td><td>{{if not .Enabled}}disabled · {{end}}<span class="{{if eq .Status "error"}}bad{{end}}">{{.Status}}</span></td><td>{{since .LastHandshake}}</td><td>↓ {{bytes .RXBytes}} / ↑ {{bytes .TXBytes}}</td></tr>{{else}}<tr><td colspan="6">No tunnels yet.</td></tr>{{end}}</tbody></table>{{template "foot" .}}{{end}}
 {{define "settings"}}{{template "head" .}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="row"><div><h2>Upstream</h2><label>IPv6 delegated prefix</label><input name="upstream_v6" value="{{.Settings.UpstreamV6}}" placeholder="2001:db8::/48" required><label>Server address/prefix</label><input name="server_address" value="{{.Settings.ServerAddress}}" placeholder="2001:db8::1/64"><label>Public IPv4 (informational)</label><input name="upstream_v4" value="{{.Settings.UpstreamV4}}"><label>Upstream interface</label><input name="upstream_interface" value="{{.Settings.UpstreamInterface}}"></div><div><h2>WireGuard</h2><label>Interface</label><input name="interface_name" value="{{.Settings.InterfaceName}}" required><label>Endpoint hostname/IP</label><input name="endpoint_host" value="{{.Settings.EndpointHost}}" required><label>Listen port</label><input type="number" name="endpoint_port" value="{{.Settings.EndpointPort}}" required><label>MTU</label><input type="number" name="mtu" value="{{.Settings.MTU}}"><label>Keepalive seconds</label><input type="number" name="keepalive" value="{{.Settings.Keepalive}}"></div></div><div class="row"><div><h2>Allocation</h2><label>Largest allowed allocation prefix</label><input type="number" name="min_prefix" value="{{.Settings.MinPrefix}}"><label>Smallest allowed allocation prefix</label><input type="number" name="max_prefix" value="{{.Settings.MaxPrefix}}"><label>Default prefix</label><input type="number" name="default_prefix" value="{{.Settings.DefaultPrefix}}"></div><div><h2>Clients</h2><label>Default DNS</label><input name="default_dns" value="{{.Settings.DefaultDNS}}"><label><input type="checkbox" name="v4_nat" {{if .Settings.V4NAT}}checked{{end}}> Enable IPv4 NAT</label><label>Internal IPv4 pool</label><input name="v4_pool" value="{{.Settings.V4Pool}}"></div></div><p><button>Save and apply</button></p></form>{{template "foot" .}}{{end}}
 {{define "new"}}{{template "head" .}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Label</label><input name="label" required><label>Allocation size</label><select name="prefix">{{range .Prefixes}}<option value="{{.}}" {{if eq . $.Settings.DefaultPrefix}}selected{{end}}>/{{.}}</option>{{end}}</select><label><input type="checkbox" name="generate" checked> Generate client keypair (private key is stored and shown to the admin)</label><label>Client public key (uncheck generate to use)</label><input name="public_key"><label>DNS override</label><input name="dns" placeholder="{{.Settings.DefaultDNS}}">{{if .Settings.V4NAT}}<label><input type="checkbox" name="v4"> Enable NATed IPv4</label>{{end}}<p><button>Create and apply</button></p></form>{{template "foot" .}}{{end}}
-{{define "detail"}}{{template "head" .}}<p><strong>IPv6 allocation:</strong> {{.Tunnel.V6CIDR}}<br><strong>IPv4:</strong> {{if .Tunnel.V4Address}}{{.Tunnel.V4Address}}{{else}}disabled{{end}}<br><strong>State:</strong> {{if not .Tunnel.Enabled}}disabled · {{end}}{{.Tunnel.Status}}{{if .Tunnel.LastError}} — <span class="bad">{{.Tunnel.LastError}}</span>{{end}}</p><h2>Client configuration</h2><pre>{{.Config}}</pre>{{if .Tunnel.PrivateKey}}<p class="muted">This server-generated private key is sensitive. Prefer client-generated keys for higher-security deployments.</p>{{end}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="toggle"><button>{{if .Tunnel.Enabled}}Disable{{else}}Enable{{end}} tunnel</button></form><h2>Delete</h2><form method="post" class="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="delete"><p>Deletion immediately removes the peer and route and frees the allocation.</p><button>Delete tunnel</button></form>{{template "foot" .}}{{end}}`
+{{define "detail"}}{{template "head" .}}<p><strong>IPv6 allocation:</strong> {{.Tunnel.V6CIDR}}<br><strong>IPv4:</strong> {{if and .Settings.V4NAT .Tunnel.V4Enabled}}{{.Tunnel.V4Address}}{{else}}disabled{{end}}<br><strong>State:</strong> {{if not .Tunnel.Enabled}}disabled · {{end}}{{.Tunnel.Status}}{{if .Tunnel.LastError}} — <span class="bad">{{.Tunnel.LastError}}</span>{{end}}</p><h2>Client configuration</h2><pre>{{.Config}}</pre>{{if .Tunnel.PrivateKey}}<h3>Scan configuration</h3><p><img src="/tunnels/{{.Tunnel.ID}}/qr.png" width="320" height="320" alt="QR code containing the WireGuard configuration"></p><p class="muted">The QR code contains the private key and full configuration. Treat it as sensitive. Client-generated keys remain the preferred higher-security workflow.</p>{{else}}<p class="muted">QR code unavailable because the client private key remains client-side.</p>{{end}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="toggle"><button>{{if .Tunnel.Enabled}}Disable{{else}}Enable{{end}} tunnel</button></form><h2>Delete</h2><form method="post" class="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="delete"><p>Deletion immediately removes the peer and route and frees the allocation.</p><button>Delete tunnel</button></form>{{template "foot" .}}{{end}}`
