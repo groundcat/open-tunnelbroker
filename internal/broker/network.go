@@ -143,7 +143,7 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 		} else {
 			_ = netlink.RouteDel(v6Route)
 		}
-		if t.V4Enabled && t.V4Address != "" {
+		if t.V4Address != "" {
 			a := netip.MustParseAddr(t.V4Address)
 			v4Route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.PrefixFrom(a, 32)), Protocol: 0x42}
 			if t.Enabled && tunnelIPv4Enabled(cfg, t) {
@@ -162,14 +162,18 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 			}
 		}
 	}
-	if cfg.V4Warp {
-		if err = k.ensureWarp(cfg, warp); err != nil {
+	warpEnabled := false
+	for _, t := range tunnels {
+		warpEnabled = warpEnabled || tunnelV4Mode(cfg, t) == V4ModeWarp
+	}
+	if warpEnabled {
+		if err = k.ensureWarp(cfg, warp, tunnels); err != nil {
 			return tunnels, err
 		}
 	} else if err = k.disableWarp(); err != nil {
 		return tunnels, err
 	}
-	if err = k.applyNAT(ctx, cfg); err != nil {
+	if err = k.applyNAT(ctx, cfg, tunnels); err != nil {
 		return tunnels, err
 	}
 	return tunnels, nil
@@ -251,7 +255,13 @@ func (k *LinuxKernel) Inspect(cfg Settings, warp WarpAccount, tunnels []Tunnel) 
 			drift = append(drift, fmt.Sprintf("tunnel %d IPv4 route is missing", t.ID))
 		}
 	}
-	if cfg.V4Warp {
+	warpSources := make(map[string]bool)
+	for _, tunnel := range tunnels {
+		if tunnelV4Mode(cfg, tunnel) == V4ModeWarp && tunnel.V4Address != "" {
+			warpSources[tunnel.V4Address+"/32"] = true
+		}
+	}
+	if len(warpSources) > 0 {
 		link, linkErr := netlink.LinkByName(warpInterfaceName)
 		if linkErr != nil {
 			drift = append(drift, "Cloudflare WARP interface is missing")
@@ -265,15 +275,16 @@ func (k *LinuxKernel) Inspect(cfg Settings, warp WarpAccount, tunnels []Tunnel) 
 		if rulesErr != nil {
 			return nil, rulesErr
 		}
-		ruleFound := false
+		foundSources := make(map[string]bool)
 		for _, rule := range rules {
-			if rule.Table == warpRouteTable && rule.Priority == warpRulePriority && rule.Src != nil && rule.Src.String() == netip.MustParsePrefix(cfg.V4Pool).Masked().String() {
-				ruleFound = true
-				break
+			if rule.Table == warpRouteTable && rule.Priority == warpRulePriority && rule.Src != nil {
+				foundSources[rule.Src.String()] = true
 			}
 		}
-		if !ruleFound {
-			drift = append(drift, "Cloudflare WARP policy rule is missing")
+		for source := range warpSources {
+			if !foundSources[source] {
+				drift = append(drift, "Cloudflare WARP policy rule is missing for "+source)
+			}
 		}
 		warpRoutes, routesErr := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: warpRouteTable}, netlink.RT_FILTER_TABLE)
 		if routesErr != nil {
@@ -317,7 +328,7 @@ func (k *LinuxKernel) Remove(cfg Settings, t Tunnel) error {
 	return wg.ConfigureDevice(cfg.InterfaceName, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: pub, Remove: true}}})
 }
 
-func (k *LinuxKernel) ensureWarp(cfg Settings, account WarpAccount) error {
+func (k *LinuxKernel) ensureWarp(cfg Settings, account WarpAccount, tunnels []Tunnel) error {
 	if !account.Exists() {
 		return errors.New("Cloudflare WARP is enabled but no account exists")
 	}
@@ -375,18 +386,32 @@ func (k *LinuxKernel) ensureWarp(cfg Settings, account WarpAccount) error {
 	if err = wg.ConfigureDevice(warpInterfaceName, wgtypes.Config{PrivateKey: &privateKey, ReplacePeers: true, Peers: []wgtypes.PeerConfig{{PublicKey: peerKey, Endpoint: endpoint, ReplaceAllowedIPs: true, AllowedIPs: []net.IPNet{allowed}, PersistentKeepaliveInterval: &keepalive}}}); err != nil {
 		return err
 	}
-	pool, err := netip.ParsePrefix(cfg.V4Pool)
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
 	if err != nil {
 		return err
 	}
-	rule := netlink.NewRule()
-	rule.Family = netlink.FAMILY_V4
-	rule.Priority = warpRulePriority
-	rule.Table = warpRouteTable
-	rule.Src = prefixIPNet(pool)
-	_ = netlink.RuleDel(rule)
-	if err = netlink.RuleAdd(rule); err != nil {
-		return err
+	for _, existing := range rules {
+		if existing.Table == warpRouteTable && existing.Priority == warpRulePriority {
+			copy := existing
+			_ = netlink.RuleDel(&copy)
+		}
+	}
+	for _, tunnel := range tunnels {
+		if tunnelV4Mode(cfg, tunnel) != V4ModeWarp || tunnel.V4Address == "" {
+			continue
+		}
+		source, parseErr := netip.ParseAddr(tunnel.V4Address)
+		if parseErr != nil {
+			return parseErr
+		}
+		rule := netlink.NewRule()
+		rule.Family = netlink.FAMILY_V4
+		rule.Priority = warpRulePriority
+		rule.Table = warpRouteTable
+		rule.Src = prefixIPNet(netip.PrefixFrom(source, 32))
+		if err = netlink.RuleAdd(rule); err != nil {
+			return err
+		}
 	}
 	defaultRoute := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.MustParsePrefix("0.0.0.0/0")), Table: warpRouteTable}
 	if err = netlink.RouteReplace(defaultRoute); err != nil {
@@ -428,7 +453,7 @@ func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAc
 	if k.DryRun {
 		return "fl=test\nip=203.0.113.8\nwarp=on\n", nil
 	}
-	if !cfg.V4Warp || !account.Exists() {
+	if !account.Exists() {
 		return "", errors.New("Cloudflare WARP IPv4 egress is not ready")
 	}
 	pool, err := netip.ParsePrefix(cfg.V4Pool)
@@ -445,6 +470,16 @@ func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAc
 		return "", err
 	}
 	defer func() { _ = netlink.AddrDel(loopback, temporary) }()
+	rule := netlink.NewRule()
+	rule.Family = netlink.FAMILY_V4
+	rule.Priority = warpRulePriority - 1
+	rule.Table = warpRouteTable
+	rule.Src = prefixIPNet(netip.PrefixFrom(testAddress, 32))
+	_ = netlink.RuleDel(rule)
+	if err = netlink.RuleAdd(rule); err != nil {
+		return "", err
+	}
+	defer func() { _ = netlink.RuleDel(rule) }()
 	dialer := &net.Dialer{Timeout: 8 * time.Second, LocalAddr: &net.TCPAddr{IP: net.IP(testAddress.AsSlice())}}
 	client := &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: dialer.DialContext}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://1.1.1.1/cdn-cgi/trace", nil)
@@ -474,21 +509,31 @@ func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAc
 	return trace + "\n", nil
 }
 
-func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings) error {
+func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings, tunnels []Tunnel) error {
 	if cfg.UpstreamInterface == "" {
 		return errors.New("upstream interface is required")
 	}
 	script := fmt.Sprintf("delete table inet open_tunnelbroker\nadd table inet open_tunnelbroker\nadd chain inet open_tunnelbroker forward { type filter hook forward priority 0; policy drop; }\nadd rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, cfg.UpstreamInterface, cfg.UpstreamInterface, cfg.InterfaceName)
-	egress := cfg.UpstreamInterface
-	if cfg.V4Warp {
-		egress = warpInterfaceName
-		script += fmt.Sprintf("add rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, egress, egress, cfg.InterfaceName)
+	warpEnabled := false
+	for _, tunnel := range tunnels {
+		warpEnabled = warpEnabled || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
 	}
-	if cfg.V4NAT || cfg.V4Warp {
-		if cfg.V4Pool == "" {
-			return errors.New("IPv4 egress needs an internal pool")
+	if warpEnabled {
+		script += fmt.Sprintf("add rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, warpInterfaceName, warpInterfaceName, cfg.InterfaceName)
+	}
+	var natRules string
+	for _, tunnel := range tunnels {
+		if !tunnelIPv4Enabled(cfg, tunnel) {
+			continue
 		}
-		script += fmt.Sprintf("add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\nadd rule inet open_tunnelbroker postrouting ip saddr %s oifname %q masquerade\n", cfg.V4Pool, egress)
+		egress := cfg.UpstreamInterface
+		if tunnelV4Mode(cfg, tunnel) == V4ModeWarp {
+			egress = warpInterfaceName
+		}
+		natRules += fmt.Sprintf("add rule inet open_tunnelbroker postrouting ip saddr %s/32 oifname %q masquerade\n", tunnel.V4Address, egress)
+	}
+	if natRules != "" {
+		script += "add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\n" + natRules
 	}
 	return runNft(ctx, script)
 }

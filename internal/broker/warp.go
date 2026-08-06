@@ -117,7 +117,15 @@ func (a *App) RegisterWarp(ctx context.Context, admin string) (WarpAccount, erro
 	if err != nil {
 		return account, err
 	}
-	if cfg.V4Warp {
+	tunnels, tunnelsErr := a.store.Tunnels()
+	if tunnelsErr != nil {
+		return account, tunnelsErr
+	}
+	warpConfigured := cfg.V4Warp
+	for _, tunnel := range tunnels {
+		warpConfigured = warpConfigured || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
+	}
+	if warpConfigured {
 		if err = a.Reconcile(ctx); err != nil {
 			return account, fmt.Errorf("WARP account saved but apply failed: %w", err)
 		}
@@ -134,7 +142,15 @@ func (a *App) TestWarp(ctx context.Context, admin string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !cfg.V4Warp {
+	tunnels, err := a.store.Tunnels()
+	if err != nil {
+		return "", err
+	}
+	warpConfigured := cfg.V4Warp
+	for _, tunnel := range tunnels {
+		warpConfigured = warpConfigured || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
+	}
+	if !warpConfigured {
 		return "", errors.New("Cloudflare WARP IPv4 egress is not enabled")
 	}
 	account, err := a.store.WarpAccount()

@@ -60,6 +60,9 @@ func TestIPv4EgressModesAreExclusiveAndWarpNeedsAccount(t *testing.T) {
 	if err := a.SaveSettings(cfg); err == nil || !strings.Contains(err.Error(), "create a Cloudflare WARP account") {
 		t.Fatalf("expected missing account error, got %v", err)
 	}
+	if _, err := a.CreateTunnel(CreateTunnelInput{Label: "warp", V4Mode: V4ModeWarp, GenerateKeys: true}, "admin"); err == nil || !strings.Contains(err.Error(), "create a Cloudflare WARP account") {
+		t.Fatalf("expected tunnel override missing account error, got %v", err)
+	}
 }
 
 func TestWarpTraceIsPersisted(t *testing.T) {

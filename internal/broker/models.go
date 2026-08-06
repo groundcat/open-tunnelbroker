@@ -4,6 +4,13 @@ import "time"
 
 const warpInterfaceName = "wg-warp"
 
+const (
+	V4ModeInherit = ""
+	V4ModeOff     = "off"
+	V4ModeNative  = "native"
+	V4ModeWarp    = "warp"
+)
+
 type Settings struct {
 	UpstreamV6        string
 	UpstreamV4        string
@@ -29,6 +36,7 @@ type Tunnel struct {
 	InterfaceID                                                                                   int64
 	Label, PublicKey, PresharedKey, PrivateKey, V6CIDR, V4Address, DNSOverride, Status, LastError string
 	V4Enabled, Enabled                                                                            bool
+	V4Mode                                                                                        string
 	MTUOverride                                                                                   int
 	CreatedAt, UpdatedAt                                                                          time.Time
 	LastHandshake                                                                                 time.Time
@@ -59,5 +67,26 @@ func (w WarpAccount) Exists() bool {
 }
 
 func tunnelIPv4Enabled(cfg Settings, tunnel Tunnel) bool {
-	return (cfg.V4NAT || cfg.V4Warp) && tunnel.V4Address != ""
+	return tunnelV4Mode(cfg, tunnel) != V4ModeOff && tunnel.V4Address != ""
+}
+
+func globalV4Mode(cfg Settings) string {
+	if cfg.V4Warp {
+		return V4ModeWarp
+	}
+	if cfg.V4NAT {
+		return V4ModeNative
+	}
+	return V4ModeOff
+}
+
+func tunnelV4Mode(cfg Settings, tunnel Tunnel) string {
+	if tunnel.V4Mode != V4ModeInherit {
+		return tunnel.V4Mode
+	}
+	return globalV4Mode(cfg)
+}
+
+func validTunnelV4Mode(mode string) bool {
+	return mode == V4ModeInherit || mode == V4ModeOff || mode == V4ModeNative || mode == V4ModeWarp
 }

@@ -166,8 +166,9 @@ func validateSettings(v Settings) error {
 
 type CreateTunnelInput struct {
 	Label, PublicKey, DNS string
+	V4Mode                string
 	Prefix                int
-	V4, GenerateKeys      bool
+	GenerateKeys          bool
 }
 
 func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
@@ -182,6 +183,18 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	}
 	if strings.TrimSpace(in.Label) == "" {
 		return Tunnel{}, errors.New("label is required")
+	}
+	if !validTunnelV4Mode(in.V4Mode) {
+		return Tunnel{}, errors.New("invalid IPv4 egress mode")
+	}
+	if in.V4Mode == V4ModeWarp {
+		account, accountErr := a.store.WarpAccount()
+		if accountErr != nil {
+			return Tunnel{}, accountErr
+		}
+		if !account.Exists() {
+			return Tunnel{}, errors.New("create a Cloudflare WARP account before selecting WARP IPv4 egress")
+		}
 	}
 	if in.Prefix == 0 {
 		in.Prefix = cfg.DefaultPrefix
@@ -206,7 +219,8 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Enabled: cfg.V4NAT || cfg.V4Warp, Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, Enabled: true}
+	t.V4Enabled = tunnelV4Mode(cfg, t) != V4ModeOff
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
 		if e != nil {
@@ -235,6 +249,29 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 		return t, fmt.Errorf("tunnel saved but apply failed: %w", e)
 	}
 	return a.store.Tunnel(t.ID)
+}
+func (a *App) SetTunnelV4Mode(id int64, mode, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !validTunnelV4Mode(mode) {
+		return errors.New("invalid IPv4 egress mode")
+	}
+	if _, err := a.store.Tunnel(id); err != nil {
+		return err
+	}
+	if mode == V4ModeWarp {
+		account, err := a.store.WarpAccount()
+		if err != nil {
+			return err
+		}
+		if !account.Exists() {
+			return errors.New("create a Cloudflare WARP account before selecting WARP IPv4 egress")
+		}
+	}
+	if err := a.store.SetTunnelV4Mode(id, mode, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
 }
 func (a *App) DeleteTunnel(id int64, admin string) error {
 	a.mu.Lock()
@@ -274,18 +311,41 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	if cfg.UpstreamV6 == "" {
 		return nil
 	}
-	if cfg.V4NAT || cfg.V4Warp {
+	ts, e := a.store.Tunnels()
+	if e != nil {
+		return e
+	}
+	needsIPv4 := false
+	needsWarp := false
+	for _, t := range ts {
+		mode := tunnelV4Mode(cfg, t)
+		needsIPv4 = needsIPv4 || mode != V4ModeOff
+		needsWarp = needsWarp || mode == V4ModeWarp
+	}
+	if needsWarp {
+		account, accountErr := a.store.WarpAccount()
+		if accountErr != nil {
+			return accountErr
+		}
+		if !account.Exists() {
+			return errors.New("create a Cloudflare WARP account before applying WARP IPv4 egress")
+		}
+	}
+	if needsIPv4 {
 		pool, parseErr := netip.ParsePrefix(cfg.V4Pool)
 		if parseErr != nil {
 			return parseErr
 		}
-		if e = a.store.EnsureIPv4Allocations(pool); e != nil {
+		if !pool.Addr().Is4() {
+			return errors.New("v4 pool must be an IPv4 CIDR")
+		}
+		if e = a.store.EnsureIPv4Allocations(cfg); e != nil {
 			return e
 		}
-	}
-	ts, e := a.store.Tunnels()
-	if e != nil {
-		return e
+		ts, e = a.store.Tunnels()
+		if e != nil {
+			return e
+		}
 	}
 	warp, e := a.store.WarpAccount()
 	if e != nil {

@@ -153,6 +153,62 @@ func TestEnablingGlobalIPv4BackfillsExistingTunnels(t *testing.T) {
 	}
 }
 
+func TestTunnelIPv4ModeOverridesGlobalDefault(t *testing.T) {
+	a, _ := testApp(t)
+	cfg := mustSettings(t, a)
+
+	native, err := a.CreateTunnel(CreateTunnelInput{Label: "native", V4Mode: V4ModeNative, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.V4Mode != V4ModeNative || native.V4Address != "10.99.0.1" || !tunnelIPv4Enabled(cfg, native) {
+		t.Fatalf("native override was not applied: %+v", native)
+	}
+	if current := mustSettings(t, a); current.V4NAT || current.V4Warp {
+		t.Fatalf("tunnel override changed global mode: %+v", current)
+	}
+	if generated := a.ClientConfig(native, cfg); !containsAll(generated, "10.99.0.1/32", "AllowedIPs = 0.0.0.0/0, ::/0") {
+		t.Fatalf("override missing from client config: %s", generated)
+	}
+
+	cfg.V4NAT = true
+	if err = a.SaveSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := a.CreateTunnel(CreateTunnelInput{Label: "disabled", V4Mode: V4ModeOff, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.V4Address != "" || tunnelIPv4Enabled(cfg, disabled) {
+		t.Fatalf("disabled override inherited global native mode: %+v", disabled)
+	}
+}
+
+func TestExistingTunnelIPv4ModeCanBeEdited(t *testing.T) {
+	a, _ := testApp(t)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "editable", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.SetTunnelV4Mode(tunnel.ID, V4ModeNative, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	tunnel, err = a.store.Tunnel(tunnel.ID)
+	if err != nil || tunnel.V4Mode != V4ModeNative || tunnel.V4Address != "10.99.0.1" {
+		t.Fatalf("mode edit was not persisted and allocated: %+v, %v", tunnel, err)
+	}
+	if err = a.SetTunnelV4Mode(tunnel.ID, V4ModeOff, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	tunnel, err = a.store.Tunnel(tunnel.ID)
+	if err != nil || tunnel.V4Mode != V4ModeOff || tunnelIPv4Enabled(mustSettings(t, a), tunnel) {
+		t.Fatalf("disabled mode edit was not applied: %+v, %v", tunnel, err)
+	}
+	if err = a.SetTunnelV4Mode(tunnel.ID, "invalid", "admin"); err == nil {
+		t.Fatal("invalid tunnel IPv4 mode was accepted")
+	}
+}
+
 func TestResetGeneralSettingsPreservesDeploymentIdentity(t *testing.T) {
 	a, _ := testApp(t)
 	cfg := mustSettings(t, a)

@@ -65,6 +65,8 @@ In Settings, create a WARP account and then select **Cloudflare WARP NAT** as th
 
 Enabling either native or WARP IPv4 egress automatically assigns an RFC1918 address to every existing and future tunnel and renders `0.0.0.0/0, ::/0` in client configs. Disabling IPv4 egress immediately returns configs and kernel AllowedIPs/routes to IPv6-only mode; the internal assignments are retained for stable reuse.
 
+The global IPv4 egress mode is the default for every tunnel. When creating a tunnel, or later from its detail page, you can leave it on the global default or override that tunnel to disabled, native upstream NAT, or Cloudflare WARP NAT. Per-tunnel native and WARP modes can coexist; WARP overrides require a registered WARP account.
+
 Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
 
 Account creation sends a locally generated WireGuard public key, device type, locale, and current terms-of-service timestamp to Cloudflare's WARP registration API. Review Cloudflare's applicable terms before enabling this optional integration.

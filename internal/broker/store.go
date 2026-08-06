@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN last_handshake TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN rx_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN tx_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tunnels ADD COLUMN v4_mode TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
@@ -75,7 +76,7 @@ func (s *Store) SaveSettings(v Settings) error {
 		if parseErr != nil {
 			return parseErr
 		}
-		if err = ensureIPv4AllocationsTx(tx, pool); err != nil {
+		if err = ensureIPv4AllocationsTxForModes(tx, pool, v); err != nil {
 			return err
 		}
 	}
@@ -85,34 +86,36 @@ func (s *Store) SaveSettings(v Settings) error {
 	return tx.Commit()
 }
 
-func (s *Store) EnsureIPv4Allocations(pool netip.Prefix) error {
+func (s *Store) EnsureIPv4Allocations(cfg Settings) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err = ensureIPv4AllocationsTx(tx, pool); err != nil {
+	pool, err := netip.ParsePrefix(cfg.V4Pool)
+	if err != nil {
+		return err
+	}
+	if err = ensureIPv4AllocationsTxForModes(tx, pool, cfg); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func ensureIPv4AllocationsTx(tx *sql.Tx, pool netip.Prefix) error {
-	pool = pool.Masked()
-	rows, err := tx.Query(`SELECT id,COALESCE(allocated_v4_internal,''),v4_enabled FROM tunnels ORDER BY id`)
+func ensureIPv4AllocationsTxForModes(tx *sql.Tx, pool netip.Prefix, cfg Settings) error {
+	rows, err := tx.Query(`SELECT id,COALESCE(allocated_v4_internal,''),v4_mode FROM tunnels ORDER BY id`)
 	if err != nil {
 		return err
 	}
 	type allocation struct {
-		id      int64
-		address string
-		enabled bool
+		id            int64
+		address, mode string
 	}
 	var tunnels []allocation
 	used := make(map[netip.Addr]bool)
 	for rows.Next() {
 		var tunnel allocation
-		if err = rows.Scan(&tunnel.id, &tunnel.address, &tunnel.enabled); err != nil {
+		if err = rows.Scan(&tunnel.id, &tunnel.address, &tunnel.mode); err != nil {
 			rows.Close()
 			return err
 		}
@@ -125,19 +128,15 @@ func ensureIPv4AllocationsTx(tx *sql.Tx, pool netip.Prefix) error {
 		return err
 	}
 	for _, tunnel := range tunnels {
-		if tunnel.address != "" && tunnel.enabled {
+		if tunnelV4Mode(cfg, Tunnel{V4Mode: tunnel.mode}) == V4ModeOff || tunnel.address != "" {
 			continue
 		}
-		address := tunnel.address
-		if address == "" {
-			next, ok := nextFreeIPv4(pool, used)
-			if !ok {
-				return ErrPoolExhausted
-			}
-			address = next.String()
-			used[next] = true
+		next, ok := nextFreeIPv4(pool.Masked(), used)
+		if !ok {
+			return ErrPoolExhausted
 		}
-		if _, err = tx.Exec(`UPDATE tunnels SET allocated_v4_internal=?,v4_enabled=1,updated_at=? WHERE id=?`, address, time.Now().UTC().Format(time.RFC3339Nano), tunnel.id); err != nil {
+		used[next] = true
+		if _, err = tx.Exec(`UPDATE tunnels SET allocated_v4_internal=?,v4_enabled=1,updated_at=? WHERE id=?`, next.String(), time.Now().UTC().Format(time.RFC3339Nano), tunnel.id); err != nil {
 			return err
 		}
 	}
@@ -186,7 +185,7 @@ func (s *Store) AddAudit(admin, action, detail string) error {
 func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	var t Tunnel
 	var created, updated, handshake string
-	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
+	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
 	if err == nil {
 		t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -195,7 +194,7 @@ func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	return t, err
 }
 
-const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
+const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
 
 func (s *Store) Tunnels() ([]Tunnel, error) {
 	rows, err := s.db.Query(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY allocated_v6_cidr`)
@@ -223,13 +222,28 @@ func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 		return e
 	}
 	defer tx.Rollback()
-	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
+	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
 	if e != nil {
 		return e
 	}
 	t.ID, _ = r.LastInsertId()
 	if _, e = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'create',?,?,?)`, admin, t.ID, t.V6CIDR, now); e != nil {
 		return e
+	}
+	return tx.Commit()
+}
+func (s *Store) SetTunnelV4Mode(id int64, mode, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE tunnels SET v4_mode=?,status='pending',updated_at=? WHERE id=?`, mode, now, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'v4-mode',?,?,?)`, admin, id, mode, now); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
