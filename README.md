@@ -8,7 +8,8 @@ The project is intentionally host-native: one Go binary, no container, no JavaSc
 
 - Allocates variable IPv6 CIDRs from any upstream prefix with a deterministic buddy allocator. Free space is rebuilt from assigned tunnels, so no free-list can drift.
 - Adds/removes WireGuard peers through the kernel API and adds matching routes immediately.
-- Applies an interface-scoped default-deny forwarding policy and optionally assigns RFC1918 addresses and masquerades them through an upstream interface.
+- Applies an interface-scoped default-deny forwarding policy and optionally assigns RFC1918 addresses masqueraded through either the native upstream or an IPv4-only Cloudflare WARP interface.
+- Creates/recreates a free WARP account from the admin UI and tests its reported outbound IPv4 address. Native and WARP IPv4 modes are mutually exclusive; IPv6 always stays on the configured upstream.
 - Generates client configs from either a supplied client public key or a server-generated keypair.
 - Authenticates admins with bcrypt, HttpOnly sessions, SameSite cookies, and CSRF tokens.
 - Marks failed applies as errors and reconciles all desired state after every restart or manual resync.
@@ -58,6 +59,14 @@ The equivalent `make test` and `make build VERSION=...` targets are provided whe
 5. In Settings enter the delegated IPv6 CIDR, a server address inside a reserved infrastructure slice (commonly the first address of the first `/64`), public endpoint, upstream interface, and allocation limits. Saving generates the server WireGuard key on first use.
 6. Permit the WireGuard UDP port at the VPS/provider firewall. The app owns only the nftables table named `open_tunnelbroker`; keep management firewall policy in a separate table.
 
+### Optional Cloudflare WARP IPv4 egress
+
+In Settings, create a WARP account and then select **Cloudflare WARP NAT** as the IPv4 egress mode. The app creates `wg-warp` with IPv4 AllowedIPs only, sends the internal RFC1918 pool through policy table 51822, and masquerades it to the WARP-assigned address. It never installs a WARP IPv6 address, AllowedIP, route, or policy rule.
+
+Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
+
+Account creation sends a locally generated WireGuard public key, device type, locale, and current terms-of-service timestamp to Cloudflare's WARP registration API. Review Cloudflare's applicable terms before enabling this optional integration.
+
 ### Example addressing
 
 For an upstream `2001:db8:1200::/48`, use `2001:db8:1200::1/64` as the server address, min/default/max prefixes of 48/56/64, and create `/56` or `/64` tunnels. The server's `/64` is automatically excluded from allocations. IPv6 is routed, never NATed.
@@ -77,8 +86,8 @@ The provider must route the entire delegated block back through the session. Ass
 ## Operations
 
 - Health and failed reconciliation are visible on the dashboard. `journalctl -u open-tunnelbroker` has underlying errors.
-- Back up with `sqlite3 /var/lib/open-tunnelbroker/broker.db '.backup /secure/path/broker.db'`. Protect the backup: it contains server and convenience-generated client private keys.
-- Never run `wg set`, modify app-owned routes, or edit the `inet open_tunnelbroker` nftables table by hand. A resync restores database state and removes unmanaged peers.
+- Back up with `sqlite3 /var/lib/open-tunnelbroker/broker.db '.backup /secure/path/broker.db'`. Protect the backup: it contains server, WARP, and convenience-generated client private keys.
+- Never run `wg set`, modify app-owned routes, edit `wg-warp`, or edit the `inet open_tunnelbroker` nftables table by hand. A resync restores database state and removes unmanaged peers.
 - Deleting a tunnel first removes its kernel peer/routes, then deletes its row and frees its prefix. If kernel removal fails, the allocation remains recorded rather than being accidentally reused.
 - `-dry-run` is intended for UI/schema evaluation on non-Linux development machines; it makes no network changes.
 

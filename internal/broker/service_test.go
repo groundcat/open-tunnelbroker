@@ -18,12 +18,17 @@ type fakeKernel struct {
 	applied  []Tunnel
 }
 
-func (f *fakeKernel) Apply(_ context.Context, _ Settings, tunnels []Tunnel) ([]Tunnel, error) {
+func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
 	f.applied = append([]Tunnel(nil), tunnels...)
 	return tunnels, f.applyErr
 }
-func (f *fakeKernel) Inspect(_ Settings, _ []Tunnel) ([]string, error) { return nil, nil }
-func (f *fakeKernel) Remove(_ Settings, _ Tunnel) error                { return nil }
+func (f *fakeKernel) Inspect(_ Settings, _ WarpAccount, _ []Tunnel) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeKernel) Remove(_ Settings, _ Tunnel) error { return nil }
+func (f *fakeKernel) TestWarp(_ context.Context, _ Settings, _ WarpAccount) (string, error) {
+	return "fl=1\nip=203.0.113.8\nwarp=on\n", nil
+}
 
 func testApp(t *testing.T) (*App, *fakeKernel) {
 	t.Helper()

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -19,12 +20,15 @@ import (
 )
 
 type App struct {
-	store    *Store
-	kernel   Kernel
-	logger   *log.Logger
-	mu       sync.Mutex
-	health   Health
-	sessions map[string]session
+	store      *Store
+	kernel     Kernel
+	logger     *log.Logger
+	mu         sync.Mutex
+	warpMu     sync.Mutex
+	health     Health
+	sessions   map[string]session
+	httpClient *http.Client
+	warpAPIURL string
 }
 type session struct {
 	Username, CSRF string
@@ -36,7 +40,7 @@ func New(path string, dry bool, logger *log.Logger) (*App, error) {
 	if e != nil {
 		return nil, e
 	}
-	return &App{store: s, kernel: &LinuxKernel{DryRun: dry}, logger: logger, sessions: map[string]session{}}, nil
+	return &App{store: s, kernel: &LinuxKernel{DryRun: dry}, logger: logger, sessions: map[string]session{}, httpClient: &http.Client{Timeout: 20 * time.Second}, warpAPIURL: defaultWarpAPIURL}, nil
 }
 func (a *App) Close() error { return a.store.Close() }
 func (a *App) BootstrapAdmin(user, password string) error {
@@ -73,6 +77,15 @@ func (a *App) SaveSettings(v Settings) error {
 	if e := validateSettings(v); e != nil {
 		return e
 	}
+	if v.V4Warp {
+		account, e := a.store.WarpAccount()
+		if e != nil {
+			return e
+		}
+		if !account.Exists() {
+			return errors.New("create a Cloudflare WARP account before enabling WARP IPv4 egress")
+		}
+	}
 	if v.ServerPrivateKey == "" {
 		k, e := wgtypes.GeneratePrivateKey()
 		if e != nil {
@@ -96,6 +109,9 @@ func validateSettings(v Settings) error {
 	if v.UpstreamInterface == "" {
 		return errors.New("upstream interface is required")
 	}
+	if v.InterfaceName == warpInterfaceName {
+		return errors.New("primary WireGuard interface name is reserved for Cloudflare WARP")
+	}
 	if v.EndpointPort < 1 || v.EndpointPort > 65535 {
 		return errors.New("invalid endpoint port")
 	}
@@ -105,7 +121,10 @@ func validateSettings(v Settings) error {
 			return errors.New("server address must be a CIDR within the upstream prefix")
 		}
 	}
-	if v.V4NAT {
+	if v.V4NAT && v.V4Warp {
+		return errors.New("native IPv4 NAT and Cloudflare WARP IPv4 egress cannot be enabled together")
+	}
+	if v.V4NAT || v.V4Warp {
 		q, e := netip.ParsePrefix(v.V4Pool)
 		if e != nil || !q.Addr().Is4() {
 			return errors.New("v4 pool must be an IPv4 CIDR")
@@ -156,7 +175,7 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Enabled: in.V4 && cfg.V4NAT, Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Enabled: in.V4 && (cfg.V4NAT || cfg.V4Warp), Enabled: true}
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
 		if e != nil {
@@ -228,7 +247,11 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	live, e := a.kernel.Apply(ctx, cfg, ts)
+	warp, e := a.store.WarpAccount()
+	if e != nil {
+		return e
+	}
+	live, e := a.kernel.Apply(ctx, cfg, warp, ts)
 	now := time.Now().UTC()
 	a.health.LastReconcile = now
 	if e != nil {
@@ -245,7 +268,7 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	for _, t := range ts {
 		_ = a.store.SetStatus(t.ID, "applied", "")
 	}
-	a.health.Drift, e = a.kernel.Inspect(cfg, ts)
+	a.health.Drift, e = a.kernel.Inspect(cfg, warp, ts)
 	if e != nil {
 		a.health.Error = e.Error()
 		return e

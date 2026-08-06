@@ -2,10 +2,13 @@ package broker
 
 import "time"
 
+const warpInterfaceName = "wg-warp"
+
 type Settings struct {
 	UpstreamV6        string
 	UpstreamV4        string
 	V4NAT             bool
+	V4Warp            bool
 	V4Pool            string
 	DefaultDNS        string
 	EndpointHost      string
@@ -38,6 +41,23 @@ type Health struct {
 	Error         string
 }
 
+type WarpAccount struct {
+	PrivateKey    string
+	PeerPublicKey string
+	IPv4Address   string
+	Endpoint      string
+	DeviceID      string
+	AccountID     string
+	AccountType   string
+	CreatedAt     time.Time
+	LastTrace     string
+	LastTestAt    time.Time
+}
+
+func (w WarpAccount) Exists() bool {
+	return w.PrivateKey != "" && w.PeerPublicKey != "" && w.IPv4Address != "" && w.Endpoint != ""
+}
+
 func tunnelIPv4Enabled(cfg Settings, tunnel Tunnel) bool {
-	return cfg.V4NAT && tunnel.V4Enabled && tunnel.V4Address != ""
+	return (cfg.V4NAT || cfg.V4Warp) && tunnel.V4Enabled && tunnel.V4Address != ""
 }

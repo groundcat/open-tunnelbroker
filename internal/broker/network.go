@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os/exec"
 	"strings"
@@ -18,13 +20,19 @@ import (
 )
 
 type Kernel interface {
-	Apply(context.Context, Settings, []Tunnel) ([]Tunnel, error)
-	Inspect(Settings, []Tunnel) ([]string, error)
+	Apply(context.Context, Settings, WarpAccount, []Tunnel) ([]Tunnel, error)
+	Inspect(Settings, WarpAccount, []Tunnel) ([]string, error)
 	Remove(Settings, Tunnel) error
+	TestWarp(context.Context, Settings, WarpAccount) (string, error)
 }
 type LinuxKernel struct{ DryRun bool }
 
-func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel) ([]Tunnel, error) {
+const (
+	warpRouteTable   = 51822
+	warpRulePriority = 90
+)
+
+func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
 	if k.DryRun {
 		return tunnels, nil
 	}
@@ -154,13 +162,20 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel)
 			}
 		}
 	}
+	if cfg.V4Warp {
+		if err = k.ensureWarp(cfg, warp); err != nil {
+			return tunnels, err
+		}
+	} else if err = k.disableWarp(); err != nil {
+		return tunnels, err
+	}
 	if err = k.applyNAT(ctx, cfg); err != nil {
 		return tunnels, err
 	}
 	return tunnels, nil
 }
 
-func (k *LinuxKernel) Inspect(cfg Settings, tunnels []Tunnel) ([]string, error) {
+func (k *LinuxKernel) Inspect(cfg Settings, warp WarpAccount, tunnels []Tunnel) ([]string, error) {
 	if k.DryRun {
 		return nil, nil
 	}
@@ -236,6 +251,45 @@ func (k *LinuxKernel) Inspect(cfg Settings, tunnels []Tunnel) ([]string, error) 
 			drift = append(drift, fmt.Sprintf("tunnel %d IPv4 route is missing", t.ID))
 		}
 	}
+	if cfg.V4Warp {
+		link, linkErr := netlink.LinkByName(warpInterfaceName)
+		if linkErr != nil {
+			drift = append(drift, "Cloudflare WARP interface is missing")
+		} else {
+			warpDevice, deviceErr := wg.Device(warpInterfaceName)
+			if deviceErr != nil || len(warpDevice.Peers) != 1 || warpDevice.Peers[0].PublicKey.String() != warp.PeerPublicKey || link.Attrs().Flags&net.FlagUp == 0 {
+				drift = append(drift, "Cloudflare WARP interface differs")
+			}
+		}
+		rules, rulesErr := netlink.RuleList(netlink.FAMILY_V4)
+		if rulesErr != nil {
+			return nil, rulesErr
+		}
+		ruleFound := false
+		for _, rule := range rules {
+			if rule.Table == warpRouteTable && rule.Priority == warpRulePriority && rule.Src != nil && rule.Src.String() == netip.MustParsePrefix(cfg.V4Pool).Masked().String() {
+				ruleFound = true
+				break
+			}
+		}
+		if !ruleFound {
+			drift = append(drift, "Cloudflare WARP policy rule is missing")
+		}
+		warpRoutes, routesErr := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: warpRouteTable}, netlink.RT_FILTER_TABLE)
+		if routesErr != nil {
+			return nil, routesErr
+		}
+		defaultFound := false
+		for _, route := range warpRoutes {
+			if route.Dst != nil && route.Dst.String() == "0.0.0.0/0" {
+				defaultFound = true
+				break
+			}
+		}
+		if !defaultFound {
+			drift = append(drift, "Cloudflare WARP policy route is missing")
+		}
+	}
 	return drift, nil
 }
 
@@ -263,16 +317,178 @@ func (k *LinuxKernel) Remove(cfg Settings, t Tunnel) error {
 	return wg.ConfigureDevice(cfg.InterfaceName, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: pub, Remove: true}}})
 }
 
+func (k *LinuxKernel) ensureWarp(cfg Settings, account WarpAccount) error {
+	if !account.Exists() {
+		return errors.New("Cloudflare WARP is enabled but no account exists")
+	}
+	privateKey, err := wgtypes.ParseKey(account.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("WARP private key: %w", err)
+	}
+	peerKey, err := wgtypes.ParseKey(account.PeerPublicKey)
+	if err != nil {
+		return fmt.Errorf("WARP peer key: %w", err)
+	}
+	address, err := netip.ParseAddr(account.IPv4Address)
+	if err != nil || !address.Is4() {
+		return errors.New("WARP account has no valid IPv4 address")
+	}
+	endpoint, err := net.ResolveUDPAddr("udp", account.Endpoint)
+	if err != nil {
+		return fmt.Errorf("resolve WARP endpoint: %w", err)
+	}
+	link, err := netlink.LinkByName(warpInterfaceName)
+	if _, ok := err.(netlink.LinkNotFoundError); ok {
+		generic := &netlink.GenericLink{LinkAttrs: netlink.LinkAttrs{Name: warpInterfaceName}, LinkType: "wireguard"}
+		if err = netlink.LinkAdd(generic); err != nil {
+			return err
+		}
+		link = generic
+	} else if err != nil {
+		return err
+	}
+	if err = netlink.LinkSetMTU(link, 1280); err != nil {
+		return err
+	}
+	addresses, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return err
+	}
+	for _, existing := range addresses {
+		if !existing.IP.Equal(net.ParseIP(account.IPv4Address)) {
+			_ = netlink.AddrDel(link, &existing)
+		}
+	}
+	if err = netlink.AddrReplace(link, &netlink.Addr{IPNet: addressIPNet(netip.PrefixFrom(address, 32))}); err != nil {
+		return err
+	}
+	if err = netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+	wg, err := wgctrl.New()
+	if err != nil {
+		return err
+	}
+	defer wg.Close()
+	keepalive := 25 * time.Second
+	allowed := *prefixIPNet(netip.MustParsePrefix("0.0.0.0/0"))
+	if err = wg.ConfigureDevice(warpInterfaceName, wgtypes.Config{PrivateKey: &privateKey, ReplacePeers: true, Peers: []wgtypes.PeerConfig{{PublicKey: peerKey, Endpoint: endpoint, ReplaceAllowedIPs: true, AllowedIPs: []net.IPNet{allowed}, PersistentKeepaliveInterval: &keepalive}}}); err != nil {
+		return err
+	}
+	pool, err := netip.ParsePrefix(cfg.V4Pool)
+	if err != nil {
+		return err
+	}
+	rule := netlink.NewRule()
+	rule.Family = netlink.FAMILY_V4
+	rule.Priority = warpRulePriority
+	rule.Table = warpRouteTable
+	rule.Src = prefixIPNet(pool)
+	_ = netlink.RuleDel(rule)
+	if err = netlink.RuleAdd(rule); err != nil {
+		return err
+	}
+	defaultRoute := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.MustParsePrefix("0.0.0.0/0")), Table: warpRouteTable}
+	if err = netlink.RouteReplace(defaultRoute); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (k *LinuxKernel) disableWarp() error {
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if rule.Table == warpRouteTable && rule.Priority == warpRulePriority {
+			copy := rule
+			_ = netlink.RuleDel(&copy)
+		}
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: warpRouteTable}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		copy := route
+		_ = netlink.RouteDel(&copy)
+	}
+	if link, linkErr := netlink.LinkByName(warpInterfaceName); linkErr == nil {
+		if err = netlink.LinkDel(link); err != nil {
+			return err
+		}
+	} else if _, ok := linkErr.(netlink.LinkNotFoundError); !ok {
+		return linkErr
+	}
+	return nil
+}
+
+func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAccount) (string, error) {
+	if k.DryRun {
+		return "fl=test\nip=203.0.113.8\nwarp=on\n", nil
+	}
+	if !cfg.V4Warp || !account.Exists() {
+		return "", errors.New("Cloudflare WARP IPv4 egress is not ready")
+	}
+	pool, err := netip.ParsePrefix(cfg.V4Pool)
+	if err != nil {
+		return "", err
+	}
+	testAddress := pool.Masked().Addr()
+	loopback, err := netlink.LinkByName("lo")
+	if err != nil {
+		return "", err
+	}
+	temporary := &netlink.Addr{IPNet: addressIPNet(netip.PrefixFrom(testAddress, 32))}
+	if err = netlink.AddrReplace(loopback, temporary); err != nil {
+		return "", err
+	}
+	defer func() { _ = netlink.AddrDel(loopback, temporary) }()
+	dialer := &net.Dialer{Timeout: 8 * time.Second, LocalAddr: &net.TCPAddr{IP: net.IP(testAddress.AsSlice())}}
+	client := &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: dialer.DialContext}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://1.1.1.1/cdn-cgi/trace", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("WARP trace request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+	if err != nil {
+		return "", err
+	}
+	trace := strings.TrimSpace(string(body))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("WARP trace returned HTTP %d", resp.StatusCode)
+	}
+	mode := firstTraceValue(trace, "warp")
+	if mode != "on" && mode != "plus" {
+		return "", fmt.Errorf("Cloudflare trace reports warp=%s", mode)
+	}
+	if firstTraceValue(trace, "ip") == "" {
+		return "", errors.New("Cloudflare trace did not report an outbound IP")
+	}
+	return trace + "\n", nil
+}
+
 func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings) error {
 	if cfg.UpstreamInterface == "" {
 		return errors.New("upstream interface is required")
 	}
 	script := fmt.Sprintf("delete table inet open_tunnelbroker\nadd table inet open_tunnelbroker\nadd chain inet open_tunnelbroker forward { type filter hook forward priority 0; policy drop; }\nadd rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, cfg.UpstreamInterface, cfg.UpstreamInterface, cfg.InterfaceName)
-	if cfg.V4NAT {
+	egress := cfg.UpstreamInterface
+	if cfg.V4Warp {
+		egress = warpInterfaceName
+		script += fmt.Sprintf("add rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, egress, egress, cfg.InterfaceName)
+	}
+	if cfg.V4NAT || cfg.V4Warp {
 		if cfg.V4Pool == "" {
-			return errors.New("v4 NAT needs an internal pool")
+			return errors.New("IPv4 egress needs an internal pool")
 		}
-		script += fmt.Sprintf("add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\nadd rule inet open_tunnelbroker postrouting ip saddr %s oifname %q masquerade\n", cfg.V4Pool, cfg.UpstreamInterface)
+		script += fmt.Sprintf("add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\nadd rule inet open_tunnelbroker postrouting ip saddr %s oifname %q masquerade\n", cfg.V4Pool, egress)
 	}
 	return runNft(ctx, script)
 }
