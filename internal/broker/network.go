@@ -50,7 +50,7 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel)
 		if e != nil {
 			return nil, fmt.Errorf("server address: %w", e)
 		}
-		ipnet := prefixIPNet(p)
+		ipnet := addressIPNet(p)
 		if e = netlink.AddrReplace(link, &netlink.Addr{IPNet: ipnet}); e != nil {
 			return nil, e
 		}
@@ -273,6 +273,11 @@ func runNft(ctx context.Context, script string) error {
 }
 func prefixIPNet(p netip.Prefix) *net.IPNet {
 	p = p.Masked()
+	a := p.Addr()
+	return &net.IPNet{IP: net.IP(a.AsSlice()), Mask: net.CIDRMask(p.Bits(), a.BitLen())}
+}
+
+func addressIPNet(p netip.Prefix) *net.IPNet {
 	a := p.Addr()
 	return &net.IPNet{IP: net.IP(a.AsSlice()), Mask: net.CIDRMask(p.Bits(), a.BitLen())}
 }
