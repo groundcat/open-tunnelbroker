@@ -50,6 +50,22 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, tunnels []Tunnel)
 		if e != nil {
 			return nil, fmt.Errorf("server address: %w", e)
 		}
+		upstream, e := netip.ParsePrefix(cfg.UpstreamV6)
+		if e != nil {
+			return nil, fmt.Errorf("upstream prefix: %w", e)
+		}
+		addresses, e := netlink.AddrList(link, netlink.FAMILY_V6)
+		if e != nil {
+			return nil, e
+		}
+		for _, existing := range addresses {
+			addr, ok := netip.AddrFromSlice(existing.IP)
+			if ok && upstream.Contains(addr) && addr != p.Addr() {
+				if e = netlink.AddrDel(link, &existing); e != nil {
+					return nil, e
+				}
+			}
+		}
 		ipnet := addressIPNet(p)
 		if e = netlink.AddrReplace(link, &netlink.Addr{IPNet: ipnet}); e != nil {
 			return nil, e
