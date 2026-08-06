@@ -8,7 +8,7 @@ The project is intentionally host-native: one Go binary, no container, no JavaSc
 
 - Allocates variable IPv6 CIDRs from any upstream prefix with a deterministic buddy allocator. Free space is rebuilt from assigned tunnels, so no free-list can drift.
 - Adds/removes WireGuard peers through the kernel API and adds matching routes immediately.
-- Optionally assigns RFC1918 addresses and masquerades them through an upstream interface.
+- Applies an interface-scoped default-deny forwarding policy and optionally assigns RFC1918 addresses and masquerades them through an upstream interface.
 - Generates client configs from either a supplied client public key or a server-generated keypair.
 - Authenticates admins with bcrypt, HttpOnly sessions, SameSite cookies, and CSRF tokens.
 - Marks failed applies as errors and reconciles all desired state after every restart or manual resync.

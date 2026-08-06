@@ -243,13 +243,16 @@ func (k *LinuxKernel) Remove(cfg Settings, t Tunnel) error {
 }
 
 func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings) error {
-	if !cfg.V4NAT {
-		return runNft(ctx, "delete table inet open_tunnelbroker\n")
+	if cfg.UpstreamInterface == "" {
+		return errors.New("upstream interface is required")
 	}
-	if cfg.V4Pool == "" || cfg.UpstreamInterface == "" {
-		return errors.New("v4 NAT needs pool and upstream interface")
+	script := fmt.Sprintf("delete table inet open_tunnelbroker\nadd table inet open_tunnelbroker\nadd chain inet open_tunnelbroker forward { type filter hook forward priority 0; policy drop; }\nadd rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, cfg.UpstreamInterface, cfg.UpstreamInterface, cfg.InterfaceName)
+	if cfg.V4NAT {
+		if cfg.V4Pool == "" {
+			return errors.New("v4 NAT needs an internal pool")
+		}
+		script += fmt.Sprintf("add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\nadd rule inet open_tunnelbroker postrouting ip saddr %s oifname %q masquerade\n", cfg.V4Pool, cfg.UpstreamInterface)
 	}
-	script := fmt.Sprintf("delete table inet open_tunnelbroker\nadd table inet open_tunnelbroker\nadd chain inet open_tunnelbroker forward { type filter hook forward priority 0; policy drop; }\nadd rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\nadd chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\nadd rule inet open_tunnelbroker postrouting ip saddr %s oifname %q masquerade\n", cfg.InterfaceName, cfg.UpstreamInterface, cfg.UpstreamInterface, cfg.InterfaceName, cfg.V4Pool, cfg.UpstreamInterface)
 	return runNft(ctx, script)
 }
 func runNft(ctx context.Context, script string) error {

@@ -93,6 +93,9 @@ func validateSettings(v Settings) error {
 	if v.EndpointHost == "" {
 		return errors.New("endpoint hostname or address is required")
 	}
+	if v.UpstreamInterface == "" {
+		return errors.New("upstream interface is required")
+	}
 	if v.EndpointPort < 1 || v.EndpointPort > 65535 {
 		return errors.New("invalid endpoint port")
 	}
