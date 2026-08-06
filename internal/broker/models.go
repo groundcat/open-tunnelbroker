@@ -37,6 +37,9 @@ type Tunnel struct {
 	Label, PublicKey, PresharedKey, PrivateKey, V6CIDR, V4Address, DNSOverride, Status, LastError string
 	V4Enabled, Enabled                                                                            bool
 	V4Mode                                                                                        string
+	QuotaGiB, QuotaUsedBytes                                                                      int64
+	QuotaPeriod                                                                                   string
+	QuotaDisabled                                                                                 bool
 	MTUOverride                                                                                   int
 	CreatedAt, UpdatedAt                                                                          time.Time
 	LastHandshake                                                                                 time.Time

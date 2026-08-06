@@ -11,14 +11,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeKernel struct {
 	applyErr error
 	applied  []Tunnel
+	traffic  map[int64][2]int64
+	applyN   int
 }
 
 func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
+	f.applyN++
+	for i := range tunnels {
+		if counters, ok := f.traffic[tunnels[i].ID]; ok {
+			tunnels[i].RXBytes = counters[0]
+			tunnels[i].TXBytes = counters[1]
+		}
+	}
 	f.applied = append([]Tunnel(nil), tunnels...)
 	return tunnels, f.applyErr
 }
@@ -58,8 +68,121 @@ func TestCreateTunnelPersistsThenApplies(t *testing.T) {
 	if len(kernel.applied) != 1 || kernel.applied[0].ID != tunnel.ID {
 		t.Fatal("kernel did not receive persisted tunnel")
 	}
+	if tunnel.QuotaGiB != 100 || tunnel.QuotaPeriod != quotaMonth(time.Now()) {
+		t.Fatalf("unexpected default monthly quota: %+v", tunnel)
+	}
 	if cfg := a.ClientConfig(tunnel, mustSettings(t, a)); !containsAll(cfg, "Address = 2001:db8:1200:100::1/56", "Endpoint = broker.example.test:51820") {
 		t.Fatalf("bad client config: %s", cfg)
+	}
+}
+
+func TestMonthlyQuotaCountsBothDirectionsAndDisablesAtLimit(t *testing.T) {
+	a, _ := testApp(t)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "quota", QuotaGiB: 1, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	hit, err := a.store.UpdateTelemetry(Tunnel{ID: tunnel.ID, RXBytes: 600 << 20, TXBytes: 424 << 20}, now)
+	if err != nil || !hit {
+		t.Fatalf("quota limit was not reported: hit=%v err=%v", hit, err)
+	}
+	stored, err := a.store.Tunnel(tunnel.ID)
+	if err != nil || stored.Enabled || !stored.QuotaDisabled || stored.QuotaUsedBytes != 1<<30 || stored.Status != "quota-exceeded" {
+		t.Fatalf("tunnel was not disabled at quota: %+v, %v", stored, err)
+	}
+
+	if err = a.SetTunnelQuota(tunnel.ID, 2, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = a.store.Tunnel(tunnel.ID)
+	if err != nil || !stored.Enabled || stored.QuotaDisabled || stored.QuotaGiB != 2 {
+		t.Fatalf("raising quota did not restore tunnel: %+v, %v", stored, err)
+	}
+}
+
+func TestReconcileImmediatelyRemovesQuotaExceededPeer(t *testing.T) {
+	a, kernel := testApp(t)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "enforced", QuotaGiB: 1, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernel.traffic = map[int64][2]int64{tunnel.ID: {700 << 20, 324 << 20}}
+	before := kernel.applyN
+	if err = a.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := a.store.Tunnel(tunnel.ID)
+	if err != nil || stored.Enabled || !stored.QuotaDisabled {
+		t.Fatalf("quota was not enforced during reconciliation: %+v, %v", stored, err)
+	}
+	if kernel.applyN != before+2 || len(kernel.applied) != 1 || kernel.applied[0].Enabled {
+		t.Fatalf("disabled peer was not immediately reapplied: calls=%d applied=%+v", kernel.applyN-before, kernel.applied)
+	}
+}
+
+func TestMonthlyQuotaResetRestoresOnlyQuotaDisabledTunnels(t *testing.T) {
+	a, _ := testApp(t)
+	quotaTunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "quota", QuotaGiB: 1, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualTunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "manual", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err = a.store.UpdateTelemetry(Tunnel{ID: quotaTunnel.ID, RXBytes: 1 << 30}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.store.SetEnabled(manualTunnel.ID, false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	nextMonth := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+	if err = a.store.ResetMonthlyQuotas(nextMonth); err != nil {
+		t.Fatal(err)
+	}
+	quotaTunnel, _ = a.store.Tunnel(quotaTunnel.ID)
+	manualTunnel, _ = a.store.Tunnel(manualTunnel.ID)
+	if !quotaTunnel.Enabled || quotaTunnel.QuotaDisabled || quotaTunnel.QuotaUsedBytes != 0 || quotaTunnel.QuotaPeriod != quotaMonth(nextMonth) {
+		t.Fatalf("quota-disabled tunnel was not reset: %+v", quotaTunnel)
+	}
+	if manualTunnel.Enabled {
+		t.Fatalf("manually disabled tunnel was re-enabled: %+v", manualTunnel)
+	}
+}
+
+func TestMonthlyQuotaHandlesWireGuardCounterReset(t *testing.T) {
+	a, _ := testApp(t)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "counters", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err = a.store.UpdateTelemetry(Tunnel{ID: tunnel.ID, RXBytes: 100, TXBytes: 200}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.store.UpdateTelemetry(Tunnel{ID: tunnel.ID, RXBytes: 10, TXBytes: 20}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tunnel, err = a.store.Tunnel(tunnel.ID)
+	if err != nil || tunnel.QuotaUsedBytes != 330 {
+		t.Fatalf("counter reset delta was counted incorrectly: %+v, %v", tunnel, err)
+	}
+}
+
+func TestTunnelCreateAndEditFormsExposeMonthlyQuota(t *testing.T) {
+	a, _ := testApp(t)
+	newRecorder := httptest.NewRecorder()
+	a.render(newRecorder, "new", view{Title: "New tunnel", Settings: mustSettings(t, a), Prefixes: []int{56}})
+	if body := newRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="100"`, "Monthly upload + download quota") {
+		t.Fatalf("new tunnel quota field is missing: %s", body)
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	a.render(detailRecorder, "detail", view{Title: "Tunnel", Tunnel: Tunnel{ID: 1, V6CIDR: "2001:db8::/64", QuotaGiB: 250, QuotaPeriod: "2026-08"}, EffectiveV4Mode: V4ModeOff})
+	if body := detailRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="250"`, "Monthly traffic:", "2026-08") {
+		t.Fatalf("edit tunnel quota field is missing: %s", body)
 	}
 }
 

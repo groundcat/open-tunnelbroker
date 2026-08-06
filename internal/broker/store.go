@@ -52,6 +52,10 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN rx_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN tx_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN v4_mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tunnels ADD COLUMN quota_gib INTEGER NOT NULL DEFAULT 100`,
+		`ALTER TABLE tunnels ADD COLUMN quota_used_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tunnels ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tunnels ADD COLUMN quota_disabled INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
@@ -185,7 +189,7 @@ func (s *Store) AddAudit(admin, action, detail string) error {
 func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	var t Tunnel
 	var created, updated, handshake string
-	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
+	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
 	if err == nil {
 		t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -194,7 +198,7 @@ func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	return t, err
 }
 
-const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
+const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
 
 func (s *Store) Tunnels() ([]Tunnel, error) {
 	rows, err := s.db.Query(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY allocated_v6_cidr`)
@@ -222,7 +226,7 @@ func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 		return e
 	}
 	defer tx.Rollback()
-	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
+	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
 	if e != nil {
 		return e
 	}
@@ -269,7 +273,7 @@ func (s *Store) DeleteTunnel(id int64, admin string) error {
 	return tx.Commit()
 }
 func (s *Store) SetEnabled(id int64, on bool, admin string) error {
-	_, e := s.db.Exec(`UPDATE tunnels SET enabled=?,status='pending',updated_at=? WHERE id=?`, on, time.Now().UTC().Format(time.RFC3339Nano), id)
+	_, e := s.db.Exec(`UPDATE tunnels SET enabled=?,quota_disabled=0,status='pending',updated_at=? WHERE id=?`, on, time.Now().UTC().Format(time.RFC3339Nano), id)
 	if e == nil {
 		_, e = s.db.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'enable',?,?,?)`, admin, id, fmt.Sprint(on), time.Now().UTC().Format(time.RFC3339Nano))
 	}
@@ -279,13 +283,80 @@ func (s *Store) SetStatus(id int64, status, msg string) error {
 	_, e := s.db.Exec(`UPDATE tunnels SET status=?,last_error=?,updated_at=? WHERE id=?`, status, msg, time.Now().UTC().Format(time.RFC3339Nano), id)
 	return e
 }
-func (s *Store) UpdateTelemetry(t Tunnel) error {
+func (s *Store) UpdateTelemetry(t Tunnel, now time.Time) (bool, error) {
 	handshake := ""
 	if !t.LastHandshake.IsZero() {
 		handshake = t.LastHandshake.UTC().Format(time.RFC3339Nano)
 	}
-	_, e := s.db.Exec(`UPDATE tunnels SET last_handshake=?,rx_bytes=?,tx_bytes=? WHERE id=?`, handshake, t.RXBytes, t.TXBytes, t.ID)
-	return e
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var oldRX, oldTX, used, quota int64
+	var period string
+	var quotaDisabled bool
+	if err = tx.QueryRow(`SELECT rx_bytes,tx_bytes,quota_used_bytes,quota_gib,quota_period,quota_disabled FROM tunnels WHERE id=?`, t.ID).Scan(&oldRX, &oldTX, &used, &quota, &period, &quotaDisabled); err != nil {
+		return false, err
+	}
+	currentPeriod := quotaMonth(now)
+	if period != currentPeriod {
+		used = 0
+		period = currentPeriod
+		quotaDisabled = false
+	}
+	used += counterDelta(oldRX, t.RXBytes) + counterDelta(oldTX, t.TXBytes)
+	exceeded := quota > 0 && used >= quota*(1<<30)
+	status := ""
+	if exceeded {
+		status = "quota-exceeded"
+	}
+	_, err = tx.Exec(`UPDATE tunnels SET last_handshake=?,rx_bytes=?,tx_bytes=?,quota_used_bytes=?,quota_period=?,quota_disabled=?,enabled=CASE WHEN ? THEN 0 ELSE enabled END,status=CASE WHEN ? THEN ? ELSE status END,updated_at=? WHERE id=?`, handshake, t.RXBytes, t.TXBytes, used, period, exceeded, exceeded, exceeded, status, now.UTC().Format(time.RFC3339Nano), t.ID)
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return exceeded && !quotaDisabled, nil
+}
+
+func counterDelta(previous, current int64) int64 {
+	if current >= previous {
+		return current - previous
+	}
+	return current
+}
+
+func quotaMonth(now time.Time) string { return now.UTC().Format("2006-01") }
+
+func (s *Store) ResetMonthlyQuotas(now time.Time) error {
+	period := quotaMonth(now)
+	_, err := s.db.Exec(`UPDATE tunnels SET quota_used_bytes=0,quota_period=?,enabled=CASE WHEN quota_disabled=1 THEN 1 ELSE enabled END,status=CASE WHEN quota_disabled=1 THEN 'pending' ELSE status END,quota_disabled=0,updated_at=? WHERE quota_period<>?`, period, now.UTC().Format(time.RFC3339Nano), period)
+	return err
+}
+
+func (s *Store) SetTunnelQuota(id, quotaGiB int64, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var used int64
+	var quotaDisabled bool
+	if err = tx.QueryRow(`SELECT quota_used_bytes,quota_disabled FROM tunnels WHERE id=?`, id).Scan(&used, &quotaDisabled); err != nil {
+		return err
+	}
+	exceeded := used >= quotaGiB*(1<<30)
+	_, err = tx.Exec(`UPDATE tunnels SET quota_gib=?,quota_disabled=?,enabled=CASE WHEN ? THEN 0 WHEN quota_disabled=1 THEN 1 ELSE enabled END,status=CASE WHEN ? THEN 'quota-exceeded' WHEN quota_disabled=1 THEN 'pending' ELSE status END,updated_at=? WHERE id=?`, quotaGiB, exceeded, exceeded, exceeded, now, id)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'quota',?,?,?)`, admin, id, fmt.Sprint(quotaGiB), now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) UsedPrefixes() ([]netip.Prefix, error) {
 	ts, e := s.Tunnels()

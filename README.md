@@ -67,6 +67,8 @@ Enabling either native or WARP IPv4 egress automatically assigns an RFC1918 addr
 
 The global IPv4 egress mode is the default for every tunnel. When creating a tunnel, or later from its detail page, you can leave it on the global default or override that tunnel to disabled, native upstream NAT, or Cloudflare WARP NAT. Per-tunnel native and WARP modes can coexist; WARP overrides require a registered WARP account.
 
+Each tunnel also has a combined upload and download quota, measured in GiB and defaulting to 100 GiB. Usage is sampled during the 30-second reconciliation cycle. A tunnel is disabled and removed from WireGuard as soon as a sample reaches its quota. Quota usage resets on the first reconciliation of each UTC calendar month; tunnels disabled by quota enforcement are automatically restored, while manually disabled tunnels remain disabled.
+
 Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
 
 Account creation sends a locally generated WireGuard public key, device type, locale, and current terms-of-service timestamp to Cloudflare's WARP registration API. Review Cloudflare's applicable terms before enabling this optional integration.

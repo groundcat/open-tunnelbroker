@@ -168,6 +168,7 @@ type CreateTunnelInput struct {
 	Label, PublicKey, DNS string
 	V4Mode                string
 	Prefix                int
+	QuotaGiB              int64
 	GenerateKeys          bool
 }
 
@@ -186,6 +187,12 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	}
 	if !validTunnelV4Mode(in.V4Mode) {
 		return Tunnel{}, errors.New("invalid IPv4 egress mode")
+	}
+	if in.QuotaGiB == 0 {
+		in.QuotaGiB = 100
+	}
+	if err := validateQuota(in.QuotaGiB); err != nil {
+		return Tunnel{}, err
 	}
 	if in.V4Mode == V4ModeWarp {
 		account, accountErr := a.store.WarpAccount()
@@ -219,7 +226,7 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), Enabled: true}
 	t.V4Enabled = tunnelV4Mode(cfg, t) != V4ModeOff
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
@@ -273,6 +280,26 @@ func (a *App) SetTunnelV4Mode(id int64, mode, admin string) error {
 	}
 	return a.reconcileLocked(context.Background())
 }
+func validateQuota(quotaGiB int64) error {
+	if quotaGiB < 1 || quotaGiB > (1<<33)-1 {
+		return errors.New("monthly quota must be between 1 and 8589934591 GiB")
+	}
+	return nil
+}
+func (a *App) SetTunnelQuota(id, quotaGiB int64, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := validateQuota(quotaGiB); err != nil {
+		return err
+	}
+	if _, err := a.store.Tunnel(id); err != nil {
+		return err
+	}
+	if err := a.store.SetTunnelQuota(id, quotaGiB, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
+}
 func (a *App) DeleteTunnel(id int64, admin string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -306,6 +333,10 @@ func (a *App) Reconcile(ctx context.Context) error {
 func (a *App) reconcileLocked(ctx context.Context) error {
 	cfg, e := a.store.Settings()
 	if e != nil {
+		return e
+	}
+	now := time.Now().UTC()
+	if e = a.store.ResetMonthlyQuotas(now); e != nil {
 		return e
 	}
 	if cfg.UpstreamV6 == "" {
@@ -352,7 +383,6 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 		return e
 	}
 	live, e := a.kernel.Apply(ctx, cfg, warp, ts)
-	now := time.Now().UTC()
 	a.health.LastReconcile = now
 	if e != nil {
 		a.health.Error = e.Error()
@@ -362,11 +392,34 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 		return e
 	}
 	a.health.Error = ""
+	quotaHit := false
 	for _, t := range live {
-		_ = a.store.UpdateTelemetry(t)
+		hit, telemetryErr := a.store.UpdateTelemetry(t, now)
+		if telemetryErr != nil {
+			a.health.Error = telemetryErr.Error()
+			return telemetryErr
+		}
+		quotaHit = quotaHit || hit
+	}
+	if quotaHit {
+		ts, e = a.store.Tunnels()
+		if e != nil {
+			return e
+		}
+		if _, e = a.kernel.Apply(ctx, cfg, warp, ts); e != nil {
+			a.health.Error = e.Error()
+			return e
+		}
+	} else {
+		ts, e = a.store.Tunnels()
+		if e != nil {
+			return e
+		}
 	}
 	for _, t := range ts {
-		_ = a.store.SetStatus(t.ID, "applied", "")
+		if !t.QuotaDisabled {
+			_ = a.store.SetStatus(t.ID, "applied", "")
+		}
 	}
 	a.health.Drift, e = a.kernel.Inspect(cfg, warp, ts)
 	if e != nil {
