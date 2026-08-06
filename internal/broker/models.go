@@ -59,5 +59,5 @@ func (w WarpAccount) Exists() bool {
 }
 
 func tunnelIPv4Enabled(cfg Settings, tunnel Tunnel) bool {
-	return (cfg.V4NAT || cfg.V4Warp) && tunnel.V4Enabled && tunnel.V4Address != ""
+	return (cfg.V4NAT || cfg.V4Warp) && tunnel.V4Address != ""
 }

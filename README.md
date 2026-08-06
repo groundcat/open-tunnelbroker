@@ -63,6 +63,8 @@ The equivalent `make test` and `make build VERSION=...` targets are provided whe
 
 In Settings, create a WARP account and then select **Cloudflare WARP NAT** as the IPv4 egress mode. The app creates `wg-warp` with IPv4 AllowedIPs only, sends the internal RFC1918 pool through policy table 51822, and masquerades it to the WARP-assigned address. It never installs a WARP IPv6 address, AllowedIP, route, or policy rule.
 
+Enabling either native or WARP IPv4 egress automatically assigns an RFC1918 address to every existing and future tunnel and renders `0.0.0.0/0, ::/0` in client configs. Disabling IPv4 egress immediately returns configs and kernel AllowedIPs/routes to IPv6-only mode; the internal assignments are retained for stable reuse.
+
 Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
 
 Account creation sends a locally generated WireGuard public key, device type, locale, and current terms-of-service timestamp to Cloudflare's WARP registration API. Review Cloudflare's applicable terms before enabling this optional integration.
@@ -90,6 +92,7 @@ The provider must route the entire delegated block back through the session. Ass
 - Never run `wg set`, modify app-owned routes, edit `wg-warp`, or edit the `inet open_tunnelbroker` nftables table by hand. A resync restores database state and removes unmanaged peers.
 - Deleting a tunnel first removes its kernel peer/routes, then deletes its row and frees its prefix. If kernel removal fails, the allocation remains recorded rather than being accidentally reused.
 - `-dry-run` is intended for UI/schema evaluation on non-Linux development machines; it makes no network changes.
+- **Reset general settings to defaults** disables IPv4 and restores the default pool, DNS, port, MTU, keepalive, and allocation sizes. It deliberately preserves upstream prefixes, endpoint host, interfaces, server address/key, and any stored WARP account.
 
 ## Development
 

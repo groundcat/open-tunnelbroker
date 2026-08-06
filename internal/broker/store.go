@@ -65,8 +65,92 @@ func (s *Store) Settings() (Settings, error) {
 	return v, err
 }
 func (s *Store) SaveSettings(v Settings) error {
-	_, err := s.db.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if v.V4NAT || v.V4Warp {
+		pool, parseErr := netip.ParsePrefix(v.V4Pool)
+		if parseErr != nil {
+			return parseErr
+		}
+		if err = ensureIPv4AllocationsTx(tx, pool); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) EnsureIPv4Allocations(pool netip.Prefix) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = ensureIPv4AllocationsTx(tx, pool); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func ensureIPv4AllocationsTx(tx *sql.Tx, pool netip.Prefix) error {
+	pool = pool.Masked()
+	rows, err := tx.Query(`SELECT id,COALESCE(allocated_v4_internal,''),v4_enabled FROM tunnels ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	type allocation struct {
+		id      int64
+		address string
+		enabled bool
+	}
+	var tunnels []allocation
+	used := make(map[netip.Addr]bool)
+	for rows.Next() {
+		var tunnel allocation
+		if err = rows.Scan(&tunnel.id, &tunnel.address, &tunnel.enabled); err != nil {
+			rows.Close()
+			return err
+		}
+		if address, parseErr := netip.ParseAddr(tunnel.address); parseErr == nil {
+			used[address] = true
+		}
+		tunnels = append(tunnels, tunnel)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, tunnel := range tunnels {
+		if tunnel.address != "" && tunnel.enabled {
+			continue
+		}
+		address := tunnel.address
+		if address == "" {
+			next, ok := nextFreeIPv4(pool, used)
+			if !ok {
+				return ErrPoolExhausted
+			}
+			address = next.String()
+			used[next] = true
+		}
+		if _, err = tx.Exec(`UPDATE tunnels SET allocated_v4_internal=?,v4_enabled=1,updated_at=? WHERE id=?`, address, time.Now().UTC().Format(time.RFC3339Nano), tunnel.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nextFreeIPv4(pool netip.Prefix, used map[netip.Addr]bool) (netip.Addr, bool) {
+	for address := pool.Masked().Addr().Next(); pool.Contains(address); address = address.Next() {
+		if !used[address] {
+			return address, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 func (s *Store) WarpAccount() (WarpAccount, error) {
@@ -215,10 +299,8 @@ func (s *Store) NextV4(pool netip.Prefix) (string, error) {
 			used[a] = true
 		}
 	}
-	for a := pool.Addr().Next(); pool.Contains(a); a = a.Next() {
-		if !used[a] {
-			return a.String(), nil
-		}
+	if address, ok := nextFreeIPv4(pool.Masked(), used); ok {
+		return address.String(), nil
 	}
 	return "", ErrPoolExhausted
 }

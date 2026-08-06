@@ -95,6 +95,37 @@ func (a *App) SaveSettings(v Settings) error {
 	}
 	return a.store.SaveSettings(v)
 }
+
+func (a *App) ResetGeneralSettings(admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, err := a.store.Settings()
+	if err != nil {
+		return err
+	}
+	upstream, err := netip.ParsePrefix(cfg.UpstreamV6)
+	if err != nil {
+		return err
+	}
+	minPrefix := max(upstream.Bits(), 48)
+	maxPrefix := max(minPrefix, 64)
+	defaultPrefix := min(max(56, minPrefix), maxPrefix)
+	cfg.V4NAT = false
+	cfg.V4Warp = false
+	cfg.V4Pool = "10.99.0.0/16"
+	cfg.DefaultDNS = "2606:4700:4700::1111"
+	cfg.EndpointPort = 51820
+	cfg.MTU = 1420
+	cfg.Keepalive = 25
+	cfg.MinPrefix = minPrefix
+	cfg.MaxPrefix = maxPrefix
+	cfg.DefaultPrefix = defaultPrefix
+	if err = a.store.SaveSettings(cfg); err != nil {
+		return err
+	}
+	_ = a.store.AddAudit(admin, "settings-reset", "general defaults restored")
+	return a.reconcileLocked(context.Background())
+}
 func validateSettings(v Settings) error {
 	p, e := netip.ParsePrefix(v.UpstreamV6)
 	if e != nil || !p.Addr().Is6() {
@@ -175,7 +206,7 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Enabled: in.V4 && (cfg.V4NAT || cfg.V4Warp), Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Enabled: cfg.V4NAT || cfg.V4Warp, Enabled: true}
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
 		if e != nil {
@@ -242,6 +273,15 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	}
 	if cfg.UpstreamV6 == "" {
 		return nil
+	}
+	if cfg.V4NAT || cfg.V4Warp {
+		pool, parseErr := netip.ParsePrefix(cfg.V4Pool)
+		if parseErr != nil {
+			return parseErr
+		}
+		if e = a.store.EnsureIPv4Allocations(pool); e != nil {
+			return e
+		}
 	}
 	ts, e := a.store.Tunnels()
 	if e != nil {

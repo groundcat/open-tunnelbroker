@@ -129,6 +129,55 @@ func TestTunnelQRCodeRequiresServerGeneratedPrivateKey(t *testing.T) {
 	}
 }
 
+func TestEnablingGlobalIPv4BackfillsExistingTunnels(t *testing.T) {
+	a, _ := testApp(t)
+	first, err := a.CreateTunnel(CreateTunnelInput{Label: "first", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.V4Address != "" {
+		t.Fatal("IPv4 was allocated while global egress was disabled")
+	}
+	cfg := mustSettings(t, a)
+	cfg.V4NAT = true
+	if err = a.SaveSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	first, err = a.store.Tunnel(first.ID)
+	if err != nil || first.V4Address != "10.99.0.1" || !first.V4Enabled {
+		t.Fatalf("existing tunnel was not backfilled: %+v, %v", first, err)
+	}
+	second, err := a.CreateTunnel(CreateTunnelInput{Label: "second", GenerateKeys: true}, "admin")
+	if err != nil || second.V4Address != "10.99.0.2" || !second.V4Enabled {
+		t.Fatalf("new tunnel did not inherit global IPv4: %+v, %v", second, err)
+	}
+}
+
+func TestResetGeneralSettingsPreservesDeploymentIdentity(t *testing.T) {
+	a, _ := testApp(t)
+	cfg := mustSettings(t, a)
+	cfg.V4NAT = true
+	cfg.V4Pool = "10.88.0.0/16"
+	cfg.DefaultDNS = "2001:db8::53"
+	cfg.EndpointPort = 12345
+	cfg.MTU = 1280
+	cfg.Keepalive = 9
+	cfg.MinPrefix, cfg.MaxPrefix, cfg.DefaultPrefix = 60, 72, 64
+	if err := a.SaveSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ResetGeneralSettings("admin"); err != nil {
+		t.Fatal(err)
+	}
+	reset := mustSettings(t, a)
+	if reset.V4NAT || reset.V4Warp || reset.V4Pool != "10.99.0.0/16" || reset.DefaultDNS != "2606:4700:4700::1111" || reset.EndpointPort != 51820 || reset.MTU != 1420 || reset.Keepalive != 25 || reset.MinPrefix != 48 || reset.DefaultPrefix != 56 || reset.MaxPrefix != 64 {
+		t.Fatalf("general defaults not restored: %+v", reset)
+	}
+	if reset.UpstreamV6 != cfg.UpstreamV6 || reset.EndpointHost != cfg.EndpointHost || reset.ServerAddress != cfg.ServerAddress || reset.ServerPrivateKey != cfg.ServerPrivateKey || reset.UpstreamInterface != cfg.UpstreamInterface || reset.InterfaceName != cfg.InterfaceName {
+		t.Fatalf("deployment identity changed: before=%+v after=%+v", cfg, reset)
+	}
+}
+
 func mustSettings(t *testing.T, a *App) Settings {
 	t.Helper()
 	cfg, err := a.store.Settings()
