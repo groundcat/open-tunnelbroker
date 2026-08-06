@@ -29,6 +29,7 @@ type App struct {
 	sessions   map[string]session
 	httpClient *http.Client
 	warpAPIURL string
+	upgrader   Upgrader
 }
 type session struct {
 	Username, CSRF string
@@ -40,7 +41,7 @@ func New(path string, dry bool, logger *log.Logger) (*App, error) {
 	if e != nil {
 		return nil, e
 	}
-	return &App{store: s, kernel: &LinuxKernel{DryRun: dry}, logger: logger, sessions: map[string]session{}, httpClient: &http.Client{Timeout: 20 * time.Second}, warpAPIURL: defaultWarpAPIURL}, nil
+	return &App{store: s, kernel: &LinuxKernel{DryRun: dry}, logger: logger, sessions: map[string]session{}, httpClient: &http.Client{Timeout: 20 * time.Second}, warpAPIURL: defaultWarpAPIURL, upgrader: NewSystemUpgrader()}, nil
 }
 func (a *App) Close() error { return a.store.Close() }
 func (a *App) BootstrapAdmin(user, password string) error {

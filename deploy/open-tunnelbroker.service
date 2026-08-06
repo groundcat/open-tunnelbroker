@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/sbin/open-tunnelbroker -db /var/lib/open-tunnelbroker/broker.db -listen 127.0.0.1:8080
 EnvironmentFile=-/etc/open-tunnelbroker/environment
+EnvironmentFile=-/etc/open-tunnelbroker/upgrade
 Restart=on-failure
 RestartSec=3
 User=root

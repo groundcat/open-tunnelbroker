@@ -40,8 +40,11 @@ The equivalent `make test` and `make build VERSION=...` targets are provided whe
    sudo apt-get update
    sudo apt-get install -y nftables wireguard-tools nginx
    sudo install -m 0755 bin/open-tunnelbroker /usr/local/sbin/open-tunnelbroker
+   sudo install -d -m 0755 /usr/local/libexec
+   sudo install -m 0755 deploy/open-tunnelbroker-upgrade /usr/local/libexec/open-tunnelbroker-upgrade
    sudo install -d -m 0700 /var/lib/open-tunnelbroker /etc/open-tunnelbroker
    sudo install -m 0644 deploy/open-tunnelbroker.service /etc/systemd/system/
+   sudo install -m 0644 deploy/open-tunnelbroker-upgrade.service /etc/systemd/system/
    sudo install -m 0644 deploy/sysctl.conf /etc/sysctl.d/90-open-tunnelbroker.conf
    ```
 
@@ -58,6 +61,21 @@ The equivalent `make test` and `make build VERSION=...` targets are provided whe
 4. Keep port 8080 bound to loopback. Put HTTPS in front with nginx (see `deploy/nginx.conf`) or reach it temporarily with `ssh -L 8080:127.0.0.1:8080 host`. Plain HTTP login is accepted only on a loopback Host; remote administration requires HTTPS.
 5. In Settings enter the delegated IPv6 CIDR, a server address inside a reserved infrastructure slice (commonly the first address of the first `/64`), public endpoint, upstream interface, and allocation limits. Saving generates the server WireGuard key on first use.
 6. Permit the WireGuard UDP port at the VPS/provider firewall. The app owns only the nftables table named `open_tunnelbroker`; keep management firewall policy in a separate table.
+
+### Web upgrades
+
+The **Upgrade** page can fast-forward the deployment checkout from its existing `origin`, run the full test suite, build and atomically install the new binary, and restart the daemon. It will refuse a dirty checkout, detached HEAD, or non-fast-forward update. The main web service can only request the fixed `open-tunnelbroker-upgrade.service`; Git, build, install, and restart privileges remain in that separate one-shot unit.
+
+Keep the deployment checkout at `/opt/open-tunnelbroker`, or configure `/etc/open-tunnelbroker/upgrade`:
+
+```sh
+OTB_UPGRADE_REPO=/opt/open-tunnelbroker
+OTB_UPGRADE_BINARY=/usr/local/sbin/open-tunnelbroker
+OTB_UPGRADE_TARGET_SERVICE=open-tunnelbroker.service
+OTB_GO_BINARY=/usr/local/go/bin/go
+```
+
+The checkout must have a working `origin` remote and unattended read credentials. The upgrade service records progress in `/var/lib/open-tunnelbroker/upgrade-status`. After installing or changing either unit, run `sudo systemctl daemon-reload`.
 
 ### Optional Cloudflare WARP IPv4 egress
 

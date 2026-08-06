@@ -23,6 +23,7 @@ type view struct {
 	Tunnels                                                   []Tunnel
 	Tunnel                                                    Tunnel
 	Health                                                    Health
+	Upgrade                                                   UpgradeStatus
 	Allocated                                                 uint64
 	Largest                                                   int
 	Prefixes                                                  []int
@@ -39,6 +40,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("/tunnels/", a.auth(a.tunnel))
 	m.HandleFunc("/resync", a.auth(a.resync))
 	m.HandleFunc("/warp", a.auth(a.warpAction))
+	m.HandleFunc("/upgrade", a.auth(a.upgradeAction))
 	return securityHeaders(m)
 }
 
@@ -182,6 +184,29 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.render(w, "settings", v)
+}
+func (a *App) upgradeAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		v := a.base(r)
+		v.Title = "Upgrade"
+		v.Notice = r.URL.Query().Get("notice")
+		v.Error = r.URL.Query().Get("error")
+		if a.upgrader != nil {
+			v.Upgrade = a.upgrader.Status(r.Context())
+		}
+		a.render(w, "upgrade", v)
+		return
+	}
+	if r.Method != http.MethodPost || !a.checkCSRF(r) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	err := a.StartUpgrade(r.Context(), r.Header.Get("X-OTB-User"))
+	destination := "/upgrade?notice=" + url.QueryEscape("Upgrade started; refresh this page to see status")
+	if err != nil {
+		destination = "/upgrade?error=" + url.QueryEscape(err.Error())
+	}
+	http.Redirect(w, r, destination, http.StatusSeeOther)
 }
 func (a *App) warpAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !a.checkCSRF(r) {
@@ -376,8 +401,9 @@ var pages = template.Must(template.New("pages").Funcs(template.FuncMap{"bytes": 
 	return t.UTC().Format(time.RFC3339)
 }}).Parse(pageHTML))
 
-const pageHTML = `{{define "head"}}<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{{.Title}} · Open IPv6 Tunnelbroker</title><style>body{font:16px system-ui,sans-serif;max-width:1050px;margin:2rem auto;padding:0 1rem;color:#222}nav{display:flex;gap:1rem;align-items:center;border-bottom:1px solid #ccc;padding-bottom:1rem}nav form{margin-left:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;border-bottom:1px solid #ddd;padding:.55rem}label{display:block;margin:.8rem 0 .25rem}input,select{padding:.45rem;min-width:20rem;max-width:100%}input[type=checkbox]{min-width:auto}button{padding:.45rem .8rem}pre{background:#eee;padding:1rem;overflow:auto}.error{background:#fee;padding:.7rem}.notice{background:#efe;padding:.7rem}.bad{color:#a00}.muted{color:#666}.row{display:flex;gap:2rem;flex-wrap:wrap}.danger{border:1px solid #a00;padding:1rem}</style></head><body>{{if .User}}<nav><strong>Open IPv6 Tunnelbroker</strong><a href="/">Dashboard</a><a href="/tunnels/new">New tunnel</a><a href="/settings">Settings</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Log out {{.User}}</button></form></nav>{{end}}<h1>{{.Title}}</h1>{{if .Error}}<p class="error">{{.Error}}</p>{{end}}{{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}{{end}}
+const pageHTML = `{{define "head"}}<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{{.Title}} · Open IPv6 Tunnelbroker</title><style>body{font:16px system-ui,sans-serif;max-width:1050px;margin:2rem auto;padding:0 1rem;color:#222}nav{display:flex;gap:1rem;align-items:center;border-bottom:1px solid #ccc;padding-bottom:1rem}nav form{margin-left:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;border-bottom:1px solid #ddd;padding:.55rem}label{display:block;margin:.8rem 0 .25rem}input,select{padding:.45rem;min-width:20rem;max-width:100%}input[type=checkbox]{min-width:auto}button{padding:.45rem .8rem}pre{background:#eee;padding:1rem;overflow:auto}.error{background:#fee;padding:.7rem}.notice{background:#efe;padding:.7rem}.bad{color:#a00}.muted{color:#666}.row{display:flex;gap:2rem;flex-wrap:wrap}.danger{border:1px solid #a00;padding:1rem}</style></head><body>{{if .User}}<nav><strong>Open IPv6 Tunnelbroker</strong><a href="/">Dashboard</a><a href="/tunnels/new">New tunnel</a><a href="/settings">Settings</a><a href="/upgrade">Upgrade</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Log out {{.User}}</button></form></nav>{{end}}<h1>{{.Title}}</h1>{{if .Error}}<p class="error">{{.Error}}</p>{{end}}{{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}{{end}}
 {{define "foot"}}</body></html>{{end}}
+{{define "upgrade"}}{{template "head" .}}<p><strong>Repository:</strong> {{if .Upgrade.Repository}}{{.Upgrade.Repository}}{{else}}not configured{{end}}<br><strong>Remote:</strong> {{.Upgrade.Remote}}<br><strong>Branch:</strong> {{.Upgrade.Branch}}<br><strong>Current revision:</strong> {{.Upgrade.Revision}}<br><strong>Last upgrade:</strong> {{.Upgrade.State}}{{if .Upgrade.Detail}} — {{.Upgrade.Detail}}{{end}}</p>{{if .Upgrade.Available}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><p>The upgrade service will require a clean checkout, fetch and fast-forward the current branch from <code>origin</code>, run all tests, build and atomically install the binary, then restart the application.</p><button>Pull, test, and deploy latest</button></form>{{else}}<p class="error">Self-upgrade is unavailable. Configure the deployment checkout and systemd upgrade unit.</p>{{end}}{{template "foot" .}}{{end}}
 {{define "detail-quota"}}{{template "head" .}}<p><strong>IPv6 allocation:</strong> {{.Tunnel.V6CIDR}}<br><strong>IPv4:</strong> {{if ne .EffectiveV4Mode "off"}}{{.Tunnel.V4Address}} ({{.EffectiveV4Mode}}){{else}}disabled{{end}}<br><strong>Monthly traffic:</strong> {{bytes .Tunnel.QuotaUsedBytes}} of {{.Tunnel.QuotaGiB}} GiB ({{.Tunnel.QuotaPeriod}})<br><strong>State:</strong> {{if .Tunnel.QuotaDisabled}}quota reached · {{else if not .Tunnel.Enabled}}disabled · {{end}}{{.Tunnel.Status}}{{if .Tunnel.LastError}} — <span class="bad">{{.Tunnel.LastError}}</span>{{end}}</p><div class="row"><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="v4-mode"><h2>IPv4 egress</h2><label>Mode for this tunnel</label><select name="v4_mode"><option value="" {{if eq .Tunnel.V4Mode ""}}selected{{end}}>Use global default</option><option value="off" {{if eq .Tunnel.V4Mode "off"}}selected{{end}}>Disabled</option><option value="native" {{if eq .Tunnel.V4Mode "native"}}selected{{end}}>Native upstream NAT</option><option value="warp" {{if eq .Tunnel.V4Mode "warp"}}selected{{end}}>Cloudflare WARP NAT</option></select><p class="muted">Effective mode: {{.EffectiveV4Mode}}.</p><p><button>Save and apply mode</button></p></form><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="quota"><h2>Monthly quota</h2><label>Combined upload + download quota (GiB)</label><input type="number" name="quota_gib" value="{{.Tunnel.QuotaGiB}}" min="1" required><p class="muted">Resets automatically each calendar month (UTC).</p><p><button>Save quota</button></p></form></div><h2>Client configuration</h2><pre>{{.Config}}</pre>{{if .Tunnel.PrivateKey}}<h3>Scan configuration</h3><p><img src="/tunnels/{{.Tunnel.ID}}/qr.png" width="320" height="320" alt="QR code containing the WireGuard configuration"></p><p class="muted">The QR code contains the private key and full configuration. Treat it as sensitive.</p>{{else}}<p class="muted">QR code unavailable because the client private key remains client-side.</p>{{end}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="toggle"><button>{{if .Tunnel.Enabled}}Disable{{else}}Enable{{end}} tunnel</button></form><h2>Delete</h2><form method="post" class="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="delete"><p>Deletion immediately removes the peer and route and frees the allocation.</p><button>Delete tunnel</button></form>{{template "foot" .}}{{end}}
 {{define "detail-v4-mode"}}{{template "head" .}}<p><strong>IPv6 allocation:</strong> {{.Tunnel.V6CIDR}}<br><strong>IPv4:</strong> {{if ne .EffectiveV4Mode "off"}}{{.Tunnel.V4Address}} ({{.EffectiveV4Mode}}){{else}}disabled{{end}}<br><strong>State:</strong> {{if not .Tunnel.Enabled}}disabled · {{end}}{{.Tunnel.Status}}{{if .Tunnel.LastError}} — <span class="bad">{{.Tunnel.LastError}}</span>{{end}}</p><h2>IPv4 egress</h2><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="v4-mode"><label>Mode for this tunnel</label><select name="v4_mode"><option value="" {{if eq .Tunnel.V4Mode ""}}selected{{end}}>Use global default</option><option value="off" {{if eq .Tunnel.V4Mode "off"}}selected{{end}}>Disabled</option><option value="native" {{if eq .Tunnel.V4Mode "native"}}selected{{end}}>Native upstream NAT</option><option value="warp" {{if eq .Tunnel.V4Mode "warp"}}selected{{end}}>Cloudflare WARP NAT</option></select><p class="muted">Effective mode: {{.EffectiveV4Mode}}. Choosing the global default keeps this tunnel synchronized with Settings.</p><p><button>Save and apply mode</button></p></form><h2>Client configuration</h2><pre>{{.Config}}</pre>{{if .Tunnel.PrivateKey}}<h3>Scan configuration</h3><p><img src="/tunnels/{{.Tunnel.ID}}/qr.png" width="320" height="320" alt="QR code containing the WireGuard configuration"></p><p class="muted">The QR code contains the private key and full configuration. Treat it as sensitive.</p>{{else}}<p class="muted">QR code unavailable because the client private key remains client-side.</p>{{end}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="toggle"><button>{{if .Tunnel.Enabled}}Disable{{else}}Enable{{end}} tunnel</button></form><h2>Delete</h2><form method="post" class="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="delete"><p>Deletion immediately removes the peer and route and frees the allocation.</p><button>Delete tunnel</button></form>{{template "foot" .}}{{end}}
 {{define "login"}}{{template "head" .}}<form method="post"><label>Username</label><input name="username" autocomplete="username" required><label>Password</label><input type="password" name="password" autocomplete="current-password" required><p><button>Log in</button></p></form>{{template "foot" .}}{{end}}

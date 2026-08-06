@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+
+repo=${OTB_UPGRADE_REPO:-/opt/open-tunnelbroker}
+target=${OTB_UPGRADE_BINARY:-/usr/local/sbin/open-tunnelbroker}
+service=${OTB_UPGRADE_TARGET_SERVICE:-open-tunnelbroker.service}
+state=${OTB_UPGRADE_STATUS:-/var/lib/open-tunnelbroker/upgrade-status}
+go_binary=${OTB_GO_BINARY:-go}
+temporary=
+
+write_status() {
+	state_directory=$(dirname "$state")
+	mkdir -p "$state_directory"
+	printf '%s\n%s\n' "$1" "$2" >"$state.tmp"
+	mv -f "$state.tmp" "$state"
+}
+
+fail() {
+	write_status failed "$1"
+	exit 1
+}
+
+cleanup() {
+	if [ -n "$temporary" ] && [ -e "$temporary" ]; then
+		rm -f "$temporary"
+	fi
+}
+trap cleanup EXIT HUP INT TERM
+
+case "$repo:$target" in
+	/*:/*) ;;
+	*) fail "repository and binary paths must be absolute" ;;
+esac
+
+[ -d "$repo/.git" ] || fail "Git checkout not found at $repo"
+cd "$repo"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || fail "checkout has local changes"
+
+branch=$(git branch --show-current)
+[ -n "$branch" ] || fail "checkout is in detached HEAD state"
+git remote get-url origin >/dev/null || fail "origin remote is not configured"
+old_revision=$(git rev-parse --short=12 HEAD)
+write_status running "fetching origin ($branch) from $old_revision"
+
+git fetch --prune origin || fail "git fetch failed"
+git merge --ff-only "origin/$branch" || fail "origin/$branch cannot be fast-forwarded"
+new_revision=$(git rev-parse --short=12 HEAD)
+write_status running "testing revision $new_revision"
+
+export GOCACHE=${GOCACHE:-/var/lib/open-tunnelbroker/go-cache}
+export GOMODCACHE=${GOMODCACHE:-/var/lib/open-tunnelbroker/go-mod-cache}
+mkdir -p "$GOCACHE" "$GOMODCACHE"
+"$go_binary" test ./... || fail "tests failed at revision $new_revision"
+
+target_directory=$(dirname "$target")
+temporary=$(mktemp "$target_directory/.open-tunnelbroker.XXXXXX")
+CGO_ENABLED=0 "$go_binary" build -trimpath -ldflags "-s -w -X main.version=$new_revision" -o "$temporary" ./cmd/open-tunnelbroker || fail "build failed at revision $new_revision"
+chmod 0755 "$temporary"
+"$temporary" -version >/dev/null || fail "built binary failed its version check"
+mv -f "$temporary" "$target"
+temporary=
+
+write_status succeeded "deployed $new_revision from origin ($branch); previous revision was $old_revision"
+systemctl restart "$service" || fail "binary was deployed but $service could not be restarted"
