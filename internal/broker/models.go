@@ -11,6 +11,12 @@ const (
 	V4ModeWarp    = "warp"
 )
 
+const (
+	InterTunnelIsolated = "isolated"
+	InterTunnelGroups   = "groups"
+	InterTunnelAny      = "any"
+)
+
 type Settings struct {
 	UpstreamV6        string
 	UpstreamV4        string
@@ -29,6 +35,7 @@ type Settings struct {
 	MaxPrefix         int
 	DefaultPrefix     int
 	UpstreamInterface string
+	InterTunnelPolicy string
 }
 
 type Tunnel struct {
@@ -40,6 +47,7 @@ type Tunnel struct {
 	QuotaGiB, QuotaUsedBytes                                                                      int64
 	QuotaPeriod                                                                                   string
 	QuotaDisabled                                                                                 bool
+	RoutingGroup                                                                                  string
 	MTUOverride                                                                                   int
 	CreatedAt, UpdatedAt                                                                          time.Time
 	LastHandshake                                                                                 time.Time

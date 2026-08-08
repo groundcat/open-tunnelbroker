@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -178,14 +179,37 @@ func TestTunnelCreateAndEditFormsExposeMonthlyQuota(t *testing.T) {
 	a, _ := testApp(t)
 	newRecorder := httptest.NewRecorder()
 	a.render(newRecorder, "new", view{Title: "New tunnel", Settings: mustSettings(t, a), Prefixes: []int{56}})
-	if body := newRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="100"`, "Monthly upload + download quota") {
+	if body := newRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="100"`, `name="routing_group"`, "Monthly upload + download quota") {
 		t.Fatalf("new tunnel quota field is missing: %s", body)
 	}
 
 	detailRecorder := httptest.NewRecorder()
-	a.render(detailRecorder, "detail", view{Title: "Tunnel", Tunnel: Tunnel{ID: 1, V6CIDR: "2001:db8::/64", QuotaGiB: 250, QuotaPeriod: "2026-08"}, EffectiveV4Mode: V4ModeOff})
-	if body := detailRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="250"`, "Monthly traffic:", "2026-08") {
+	a.render(detailRecorder, "detail", view{Title: "Tunnel", Tunnel: Tunnel{ID: 1, V6CIDR: "2001:db8::/64", QuotaGiB: 250, QuotaPeriod: "2026-08", RoutingGroup: "internal"}, EffectiveV4Mode: V4ModeOff})
+	if body := detailRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="250"`, `name="routing_group"`, `value="internal"`, "Monthly traffic:", "2026-08") {
 		t.Fatalf("edit tunnel quota field is missing: %s", body)
+	}
+}
+
+func TestRoutingPageAppliesGlobalPolicy(t *testing.T) {
+	a, _ := testApp(t)
+	getRecorder := httptest.NewRecorder()
+	a.render(getRecorder, "routing", view{Title: "Routing", Settings: mustSettings(t, a)})
+	if body := getRecorder.Body.String(); !containsAll(body, "Inter-tunnel routing policy", "Isolated", "Same routing group", "Any tunnel", "Routing-group assignments") {
+		t.Fatalf("routing policy form is incomplete: %s", body)
+	}
+
+	form := url.Values{"csrf": {"token"}, "inter_tunnel_policy": {InterTunnelAny}}
+	request := httptest.NewRequest(http.MethodPost, "/routing", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-OTB-User", "admin")
+	request.Header.Set("X-OTB-CSRF", "token")
+	recorder := httptest.NewRecorder()
+	a.routing(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("routing update returned %d", recorder.Code)
+	}
+	if cfg := mustSettings(t, a); cfg.InterTunnelPolicy != InterTunnelAny {
+		t.Fatalf("routing policy was not persisted: %+v", cfg)
 	}
 }
 
@@ -307,6 +331,82 @@ func TestTunnelIPv4ModeOverridesGlobalDefault(t *testing.T) {
 	}
 	if disabled.V4Address != "" || tunnelIPv4Enabled(cfg, disabled) {
 		t.Fatalf("disabled override inherited global native mode: %+v", disabled)
+	}
+}
+
+func TestTunnelRoutingGroupPersistsAndCanBeEdited(t *testing.T) {
+	a, _ := testApp(t)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "grouped", RoutingGroup: "production", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tunnel.RoutingGroup != "production" {
+		t.Fatalf("routing group was not created: %+v", tunnel)
+	}
+	if err = a.SetTunnelRoutingGroup(tunnel.ID, "internal services", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	tunnel, err = a.store.Tunnel(tunnel.ID)
+	if err != nil || tunnel.RoutingGroup != "internal services" {
+		t.Fatalf("routing group was not updated: %+v, %v", tunnel, err)
+	}
+	if err = a.SetTunnelRoutingGroup(tunnel.ID, "bad\ngroup", "admin"); err == nil {
+		t.Fatal("control character in routing group was accepted")
+	}
+	if err = a.SetTunnelRoutingGroup(tunnel.ID, strings.Repeat("x", 65), "admin"); err == nil {
+		t.Fatal("oversized routing group was accepted")
+	}
+}
+
+func TestInterTunnelPolicyDefaultsToIsolationAndResetsSafely(t *testing.T) {
+	a, _ := testApp(t)
+	cfg := mustSettings(t, a)
+	if cfg.InterTunnelPolicy != InterTunnelIsolated {
+		t.Fatalf("unsafe default routing policy: %q", cfg.InterTunnelPolicy)
+	}
+	cfg.InterTunnelPolicy = "invalid"
+	if err := a.SaveSettings(cfg); err == nil {
+		t.Fatal("invalid inter-tunnel policy was accepted")
+	}
+	cfg.InterTunnelPolicy = InterTunnelAny
+	if err := a.SaveSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ResetGeneralSettings("admin"); err != nil {
+		t.Fatal(err)
+	}
+	if reset := mustSettings(t, a); reset.InterTunnelPolicy != InterTunnelIsolated {
+		t.Fatalf("settings reset did not restore isolation: %+v", reset)
+	}
+}
+
+func TestRoutingMigrationAddsSafeDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "migration.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`ALTER TABLE settings DROP COLUMN inter_tunnel_policy`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`ALTER TABLE tunnels DROP COLUMN routing_group`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	cfg, err := store.Settings()
+	if err != nil || cfg.InterTunnelPolicy != InterTunnelIsolated {
+		t.Fatalf("routing policy migration is unsafe: %+v, %v", cfg, err)
+	}
+	if _, err = store.Tunnels(); err != nil {
+		t.Fatalf("routing group migration is incomplete: %v", err)
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -75,6 +77,9 @@ func token() string {
 }
 
 func (a *App) SaveSettings(v Settings) error {
+	if v.InterTunnelPolicy == "" {
+		v.InterTunnelPolicy = InterTunnelIsolated
+	}
 	if e := validateSettings(v); e != nil {
 		return e
 	}
@@ -121,6 +126,7 @@ func (a *App) ResetGeneralSettings(admin string) error {
 	cfg.MinPrefix = minPrefix
 	cfg.MaxPrefix = maxPrefix
 	cfg.DefaultPrefix = defaultPrefix
+	cfg.InterTunnelPolicy = InterTunnelIsolated
 	if err = a.store.SaveSettings(cfg); err != nil {
 		return err
 	}
@@ -162,12 +168,32 @@ func validateSettings(v Settings) error {
 			return errors.New("v4 pool must be an IPv4 CIDR")
 		}
 	}
+	if !validInterTunnelPolicy(v.InterTunnelPolicy) {
+		return errors.New("invalid inter-tunnel routing policy")
+	}
+	return nil
+}
+
+func validInterTunnelPolicy(policy string) bool {
+	return policy == InterTunnelIsolated || policy == InterTunnelGroups || policy == InterTunnelAny
+}
+
+func validateRoutingGroup(group string) error {
+	if utf8.RuneCountInString(group) > 64 {
+		return errors.New("routing group must be at most 64 characters")
+	}
+	for _, character := range group {
+		if unicode.IsControl(character) {
+			return errors.New("routing group cannot contain control characters")
+		}
+	}
 	return nil
 }
 
 type CreateTunnelInput struct {
 	Label, PublicKey, DNS string
 	V4Mode                string
+	RoutingGroup          string
 	Prefix                int
 	QuotaGiB              int64
 	GenerateKeys          bool
@@ -193,6 +219,10 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 		in.QuotaGiB = 100
 	}
 	if err := validateQuota(in.QuotaGiB); err != nil {
+		return Tunnel{}, err
+	}
+	in.RoutingGroup = strings.TrimSpace(in.RoutingGroup)
+	if err := validateRoutingGroup(in.RoutingGroup); err != nil {
 		return Tunnel{}, err
 	}
 	if in.V4Mode == V4ModeWarp {
@@ -227,7 +257,7 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), RoutingGroup: in.RoutingGroup, Enabled: true}
 	t.V4Enabled = tunnelV4Mode(cfg, t) != V4ModeOff
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
@@ -297,6 +327,21 @@ func (a *App) SetTunnelQuota(id, quotaGiB int64, admin string) error {
 		return err
 	}
 	if err := a.store.SetTunnelQuota(id, quotaGiB, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
+}
+func (a *App) SetTunnelRoutingGroup(id int64, group, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	group = strings.TrimSpace(group)
+	if err := validateRoutingGroup(group); err != nil {
+		return err
+	}
+	if _, err := a.store.Tunnel(id); err != nil {
+		return err
+	}
+	if err := a.store.SetTunnelRoutingGroup(id, group, admin); err != nil {
 		return err
 	}
 	return a.reconcileLocked(context.Background())

@@ -35,7 +35,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), upstream_v6 TEXT NOT NULL DEFAULT '', upstream_v4 TEXT NOT NULL DEFAULT '', v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, interface_name TEXT NOT NULL DEFAULT 'wg0', server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, upstream_interface TEXT NOT NULL DEFAULT 'ppp0');
+CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), upstream_v6 TEXT NOT NULL DEFAULT '', upstream_v4 TEXT NOT NULL DEFAULT '', v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, interface_name TEXT NOT NULL DEFAULT 'wg0', server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, upstream_interface TEXT NOT NULL DEFAULT 'ppp0', inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated');
 INSERT OR IGNORE INTO settings(id) VALUES(1);
 CREATE TABLE IF NOT EXISTS warp_account (id INTEGER PRIMARY KEY CHECK(id=1), private_key TEXT NOT NULL, peer_public_key TEXT NOT NULL, ipv4_address TEXT NOT NULL, endpoint TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', account_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_trace TEXT NOT NULL DEFAULT '', last_test_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash BLOB NOT NULL, created_at TEXT NOT NULL);
@@ -56,6 +56,8 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN quota_used_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN quota_disabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE settings ADD COLUMN inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated'`,
+		`ALTER TABLE tunnels ADD COLUMN routing_group TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
@@ -66,7 +68,7 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 
 func (s *Store) Settings() (Settings, error) {
 	var v Settings
-	err := s.db.QueryRow(`SELECT upstream_v6,upstream_v4,v4_nat,v4_warp,v4_pool,default_dns,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface FROM settings WHERE id=1`).Scan(&v.UpstreamV6, &v.UpstreamV4, &v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.EndpointHost, &v.EndpointPort, &v.InterfaceName, &v.ServerAddress, &v.ServerPrivateKey, &v.MTU, &v.Keepalive, &v.MinPrefix, &v.MaxPrefix, &v.DefaultPrefix, &v.UpstreamInterface)
+	err := s.db.QueryRow(`SELECT upstream_v6,upstream_v4,v4_nat,v4_warp,v4_pool,default_dns,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface,inter_tunnel_policy FROM settings WHERE id=1`).Scan(&v.UpstreamV6, &v.UpstreamV4, &v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.EndpointHost, &v.EndpointPort, &v.InterfaceName, &v.ServerAddress, &v.ServerPrivateKey, &v.MTU, &v.Keepalive, &v.MinPrefix, &v.MaxPrefix, &v.DefaultPrefix, &v.UpstreamInterface, &v.InterTunnelPolicy)
 	return v, err
 }
 func (s *Store) SaveSettings(v Settings) error {
@@ -84,7 +86,7 @@ func (s *Store) SaveSettings(v Settings) error {
 			return err
 		}
 	}
-	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface); err != nil {
+	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=?,inter_tunnel_policy=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface, v.InterTunnelPolicy); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -189,7 +191,7 @@ func (s *Store) AddAudit(admin, action, detail string) error {
 func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	var t Tunnel
 	var created, updated, handshake string
-	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
+	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.RoutingGroup, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
 	if err == nil {
 		t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -198,7 +200,7 @@ func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	return t, err
 }
 
-const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
+const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,routing_group,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
 
 func (s *Store) Tunnels() ([]Tunnel, error) {
 	rows, err := s.db.Query(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY allocated_v6_cidr`)
@@ -226,7 +228,7 @@ func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 		return e
 	}
 	defer tx.Rollback()
-	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
+	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,routing_group,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.RoutingGroup, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
 	if e != nil {
 		return e
 	}
@@ -354,6 +356,21 @@ func (s *Store) SetTunnelQuota(id, quotaGiB int64, admin string) error {
 		return err
 	}
 	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'quota',?,?,?)`, admin, id, fmt.Sprint(quotaGiB), now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) SetTunnelRoutingGroup(id int64, group, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE tunnels SET routing_group=?,status='pending',updated_at=? WHERE id=?`, group, now, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-group',?,?,?)`, admin, id, group, now); err != nil {
 		return err
 	}
 	return tx.Commit()

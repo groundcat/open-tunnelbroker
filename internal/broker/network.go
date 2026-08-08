@@ -510,30 +510,9 @@ func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAc
 }
 
 func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings, tunnels []Tunnel) error {
-	if cfg.UpstreamInterface == "" {
-		return errors.New("upstream interface is required")
-	}
-	script := fmt.Sprintf("delete table inet open_tunnelbroker\nadd table inet open_tunnelbroker\nadd chain inet open_tunnelbroker forward { type filter hook forward priority 0; policy drop; }\nadd rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, cfg.UpstreamInterface, cfg.UpstreamInterface, cfg.InterfaceName)
-	warpEnabled := false
-	for _, tunnel := range tunnels {
-		warpEnabled = warpEnabled || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
-	}
-	if warpEnabled {
-		script += fmt.Sprintf("add rule inet open_tunnelbroker forward iifname %q oifname %q accept\nadd rule inet open_tunnelbroker forward iifname %q oifname %q ct state established,related accept\n", cfg.InterfaceName, warpInterfaceName, warpInterfaceName, cfg.InterfaceName)
-	}
-	var natRules string
-	for _, tunnel := range tunnels {
-		if !tunnelIPv4Enabled(cfg, tunnel) {
-			continue
-		}
-		egress := cfg.UpstreamInterface
-		if tunnelV4Mode(cfg, tunnel) == V4ModeWarp {
-			egress = warpInterfaceName
-		}
-		natRules += fmt.Sprintf("add rule inet open_tunnelbroker postrouting ip saddr %s/32 oifname %q masquerade\n", tunnel.V4Address, egress)
-	}
-	if natRules != "" {
-		script += "add chain inet open_tunnelbroker postrouting { type nat hook postrouting priority 100; policy accept; }\n" + natRules
+	script, err := buildNFTScript(cfg, tunnels)
+	if err != nil {
+		return err
 	}
 	return runNft(ctx, script)
 }

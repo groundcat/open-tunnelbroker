@@ -9,6 +9,7 @@ The project is intentionally host-native: one Go binary, no container, no JavaSc
 - Allocates variable IPv6 CIDRs from any upstream prefix using cryptographically random selection across all currently free, correctly aligned subprefixes. Free space is rebuilt from assigned tunnels, so no free-list can drift and existing or reserved ranges cannot collide.
 - Adds/removes WireGuard peers through the kernel API and adds matching routes immediately.
 - Applies an interface-scoped default-deny forwarding policy and optionally assigns RFC1918 addresses masqueraded through either the native upstream or an IPv4-only Cloudflare WARP interface.
+- Isolates tunnels from each other by default, with optional all-to-all or same-routing-group IPv4 and IPv6 communication that never applies NAT between tunnels.
 - Creates/recreates a free WARP account from the admin UI and tests its reported outbound IPv4 address. Native and WARP IPv4 modes are mutually exclusive; IPv6 always stays on the configured upstream.
 - Generates client configs from either a supplied client public key or a server-generated keypair.
 - Authenticates admins with bcrypt, HttpOnly sessions, SameSite cookies, and CSRF tokens.
@@ -86,6 +87,16 @@ Enabling either native or WARP IPv4 egress automatically assigns an RFC1918 addr
 The global IPv4 egress mode is the default for every tunnel. When creating a tunnel, or later from its detail page, you can leave it on the global default or override that tunnel to disabled, native upstream NAT, or Cloudflare WARP NAT. Per-tunnel native and WARP modes can coexist; WARP overrides require a registered WARP account.
 
 Each tunnel also has a combined upload and download quota, measured in GiB and defaulting to 100 GiB. Usage is sampled during the 30-second reconciliation cycle. A tunnel is disabled and removed from WireGuard as soon as a sample reaches its quota. Quota usage resets on the first reconciliation of each UTC calendar month; tunnels disabled by quota enforcement are automatically restored, while manually disabled tunnels remain disabled.
+
+### Inter-tunnel routing
+
+The **Routing** page controls communication between tunnels:
+
+- **Isolated** is the secure default and installs no `wg0`-to-`wg0` forwarding rule.
+- **Same routing group** permits traffic only when both active tunnels have the same non-empty routing-group name. Group membership can be set while creating a tunnel or edited from its detail page.
+- **Any tunnel** permits all active tunnels to communicate.
+
+Group policy is rendered as nftables IPv6 interval sets containing delegated prefixes and IPv4 address sets containing internal addresses. Rules require both source and destination membership in the same set. WireGuard AllowedIPs continue to enforce source ownership, original addresses are preserved, and inter-tunnel packets never match an egress masquerade rule. Combined quota accounting charges the sender's upload and the recipient's download.
 
 Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
 
