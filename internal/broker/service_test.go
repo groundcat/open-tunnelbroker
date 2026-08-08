@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,7 +63,8 @@ func TestCreateTunnelPersistsThenApplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tunnel.V6CIDR != "2001:db8:1200:100::/56" || tunnel.Status != "applied" {
+	allocation := netip.MustParsePrefix(tunnel.V6CIDR)
+	if allocation.Bits() != 56 || !netip.MustParsePrefix("2001:db8:1200::/48").Contains(allocation.Addr()) || overlaps(allocation, netip.MustParsePrefix("2001:db8:1200::/64")) || tunnel.Status != "applied" {
 		t.Fatalf("unexpected tunnel: %+v", tunnel)
 	}
 	if len(kernel.applied) != 1 || kernel.applied[0].ID != tunnel.ID {
@@ -71,7 +73,8 @@ func TestCreateTunnelPersistsThenApplies(t *testing.T) {
 	if tunnel.QuotaGiB != 100 || tunnel.QuotaPeriod != quotaMonth(time.Now()) {
 		t.Fatalf("unexpected default monthly quota: %+v", tunnel)
 	}
-	if cfg := a.ClientConfig(tunnel, mustSettings(t, a)); !containsAll(cfg, "Address = 2001:db8:1200:100::1/56", "Endpoint = broker.example.test:51820") {
+	expectedAddress := "Address = " + firstUsable(allocation).String() + "/56"
+	if cfg := a.ClientConfig(tunnel, mustSettings(t, a)); !containsAll(cfg, expectedAddress, "Endpoint = broker.example.test:51820") {
 		t.Fatalf("bad client config: %s", cfg)
 	}
 }

@@ -6,7 +6,7 @@ The project is intentionally host-native: one Go binary, no container, no JavaSc
 
 ## What it does
 
-- Allocates variable IPv6 CIDRs from any upstream prefix with a deterministic buddy allocator. Free space is rebuilt from assigned tunnels, so no free-list can drift.
+- Allocates variable IPv6 CIDRs from any upstream prefix using cryptographically random selection across all currently free, correctly aligned subprefixes. Free space is rebuilt from assigned tunnels, so no free-list can drift and existing or reserved ranges cannot collide.
 - Adds/removes WireGuard peers through the kernel API and adds matching routes immediately.
 - Applies an interface-scoped default-deny forwarding policy and optionally assigns RFC1918 addresses masqueraded through either the native upstream or an IPv4-only Cloudflare WARP interface.
 - Creates/recreates a free WARP account from the admin UI and tests its reported outbound IPv4 address. Native and WARP IPv4 modes are mutually exclusive; IPv6 always stays on the configured upstream.
