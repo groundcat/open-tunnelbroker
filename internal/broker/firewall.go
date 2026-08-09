@@ -60,8 +60,11 @@ func interTunnelRules(cfg Settings, tunnels []Tunnel) (string, error) {
 func routingGroupRules(cfg Settings, tunnels []Tunnel) (string, error) {
 	groups := make(map[string][]Tunnel)
 	for _, tunnel := range tunnels {
-		if tunnel.Enabled && tunnel.RoutingGroup != "" {
-			groups[tunnel.RoutingGroup] = append(groups[tunnel.RoutingGroup], tunnel)
+		if !tunnel.Enabled {
+			continue
+		}
+		for _, group := range tunnel.RoutingGroups {
+			groups[group] = append(groups[group], tunnel)
 		}
 	}
 	names := make([]string, 0, len(groups))

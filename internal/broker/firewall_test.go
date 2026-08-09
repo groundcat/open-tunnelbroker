@@ -7,9 +7,9 @@ import (
 
 func routingTestTunnels() []Tunnel {
 	return []Tunnel{
-		{ID: 1, V6CIDR: "2001:db8:1::/64", V4Address: "10.99.0.1", V4Enabled: true, RoutingGroup: "alpha", Enabled: true},
-		{ID: 2, V6CIDR: "2001:db8:2::/64", V4Address: "10.99.0.2", V4Enabled: true, RoutingGroup: "alpha", Enabled: true},
-		{ID: 3, V6CIDR: "2001:db8:3::/64", V4Address: "10.99.0.3", V4Enabled: true, RoutingGroup: "beta", Enabled: true},
+		{ID: 1, V6CIDR: "2001:db8:1::/64", V4Address: "10.99.0.1", V4Enabled: true, RoutingGroups: []string{"alpha", "beta"}, Enabled: true},
+		{ID: 2, V6CIDR: "2001:db8:2::/64", V4Address: "10.99.0.2", V4Enabled: true, RoutingGroups: []string{"alpha"}, Enabled: true},
+		{ID: 3, V6CIDR: "2001:db8:3::/64", V4Address: "10.99.0.3", V4Enabled: true, RoutingGroups: []string{"beta"}, Enabled: true},
 		{ID: 4, V6CIDR: "2001:db8:4::/64", V4Address: "10.99.0.4", V4Enabled: true, Enabled: true},
 	}
 }
@@ -43,12 +43,14 @@ func TestGroupPolicyMatchesBothSourceAndDestination(t *testing.T) {
 		"10.99.0.1, 10.99.0.2",
 		"ip6 saddr @tunnel_group_0_v6 ip6 daddr @tunnel_group_0_v6 accept",
 		"ip saddr @tunnel_group_0_v4 ip daddr @tunnel_group_0_v4 accept",
+		"2001:db8:1::/64, 2001:db8:3::/64",
+		"ip6 saddr @tunnel_group_1_v6 ip6 daddr @tunnel_group_1_v6 accept",
 	} {
 		if !strings.Contains(rules, expected) {
 			t.Fatalf("group policy missing %q:\n%s", expected, rules)
 		}
 	}
-	for _, forbidden := range []string{"2001:db8:3::/64", "2001:db8:4::/64", "10.99.0.3", "ct state established"} {
+	for _, forbidden := range []string{"2001:db8:4::/64", "10.99.0.4", "ct state established"} {
 		if strings.Contains(rules, forbidden) {
 			t.Fatalf("group policy unexpectedly contains %q:\n%s", forbidden, rules)
 		}
@@ -58,6 +60,7 @@ func TestGroupPolicyMatchesBothSourceAndDestination(t *testing.T) {
 func TestGroupPolicyExcludesDisabledMembers(t *testing.T) {
 	tunnels := routingTestTunnels()
 	tunnels[1].Enabled = false
+	tunnels[2].Enabled = false
 	rules, err := interTunnelRules(Settings{InterfaceName: "wg0", InterTunnelPolicy: InterTunnelGroups, V4NAT: true}, tunnels)
 	if err != nil || rules != "" {
 		t.Fatalf("single active group member received a rule: %q, %v", rules, err)

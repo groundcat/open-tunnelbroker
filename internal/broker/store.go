@@ -40,6 +40,8 @@ INSERT OR IGNORE INTO settings(id) VALUES(1);
 CREATE TABLE IF NOT EXISTS warp_account (id INTEGER PRIMARY KEY CHECK(id=1), private_key TEXT NOT NULL, peer_public_key TEXT NOT NULL, ipv4_address TEXT NOT NULL, endpoint TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', account_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_trace TEXT NOT NULL DEFAULT '', last_test_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash BLOB NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tunnels (id INTEGER PRIMARY KEY, interface_id INTEGER NOT NULL DEFAULT 1, label TEXT NOT NULL, public_key TEXT NOT NULL UNIQUE, preshared_key TEXT NOT NULL DEFAULT '', private_key TEXT NOT NULL DEFAULT '', allocated_v6_cidr TEXT NOT NULL UNIQUE, allocated_v4_internal TEXT UNIQUE, v4_enabled INTEGER NOT NULL DEFAULT 0, dns_override TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, mtu_override INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', last_error TEXT NOT NULL DEFAULT '', last_handshake TEXT NOT NULL DEFAULT '', rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS routing_groups (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tunnel_routing_groups (tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE, group_id INTEGER NOT NULL REFERENCES routing_groups(id) ON DELETE CASCADE, PRIMARY KEY(tunnel_id,group_id));
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY, admin TEXT NOT NULL, action TEXT NOT NULL, tunnel_id INTEGER, detail TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 `)
@@ -57,13 +59,52 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN quota_disabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE settings ADD COLUMN inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated'`,
-		`ALTER TABLE tunnels ADD COLUMN routing_group TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
 		}
 	}
-	return nil
+	return s.migrateLegacyRoutingGroups()
+}
+
+func (s *Store) migrateLegacyRoutingGroups() error {
+	rows, err := s.db.Query(`PRAGMA table_info(tunnels)`)
+	if err != nil {
+		return err
+	}
+	hasLegacyColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		hasLegacyColumn = hasLegacyColumn || name == "routing_group"
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if !hasLegacyColumn {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO routing_groups(name,created_at) SELECT DISTINCT TRIM(routing_group),? FROM tunnels WHERE TRIM(routing_group)<>''`, now); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO tunnel_routing_groups(tunnel_id,group_id) SELECT t.id,g.id FROM tunnels t JOIN routing_groups g ON g.name=TRIM(t.routing_group) WHERE TRIM(t.routing_group)<>''`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE tunnels SET routing_group='' WHERE routing_group<>''`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Settings() (Settings, error) {
@@ -191,7 +232,7 @@ func (s *Store) AddAudit(admin, action, detail string) error {
 func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	var t Tunnel
 	var created, updated, handshake string
-	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.RoutingGroup, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
+	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
 	if err == nil {
 		t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -200,26 +241,91 @@ func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	return t, err
 }
 
-const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,routing_group,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
+const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
 
 func (s *Store) Tunnels() ([]Tunnel, error) {
 	rows, err := s.db.Query(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY allocated_v6_cidr`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []Tunnel
 	for rows.Next() {
 		t, e := scanTunnel(rows)
 		if e != nil {
+			rows.Close()
 			return nil, e
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if err = s.loadRoutingMemberships(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 func (s *Store) Tunnel(id int64) (Tunnel, error) {
-	return scanTunnel(s.db.QueryRow(`SELECT `+tunnelCols+` FROM tunnels WHERE id=?`, id))
+	tunnel, err := scanTunnel(s.db.QueryRow(`SELECT `+tunnelCols+` FROM tunnels WHERE id=?`, id))
+	if err != nil {
+		return tunnel, err
+	}
+	tunnels := []Tunnel{tunnel}
+	if err = s.loadRoutingMemberships(tunnels); err != nil {
+		return tunnel, err
+	}
+	return tunnels[0], nil
+}
+
+func (s *Store) loadRoutingMemberships(tunnels []Tunnel) error {
+	if len(tunnels) == 0 {
+		return nil
+	}
+	byID := make(map[int64]*Tunnel, len(tunnels))
+	for index := range tunnels {
+		byID[tunnels[index].ID] = &tunnels[index]
+	}
+	rows, err := s.db.Query(`SELECT trg.tunnel_id,g.name FROM tunnel_routing_groups trg JOIN routing_groups g ON g.id=trg.group_id ORDER BY g.name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tunnelID int64
+		var name string
+		if err = rows.Scan(&tunnelID, &name); err != nil {
+			return err
+		}
+		if tunnel := byID[tunnelID]; tunnel != nil {
+			tunnel.RoutingGroups = append(tunnel.RoutingGroups, name)
+		}
+	}
+	return rows.Err()
+}
+
+func setTunnelRoutingGroupsTx(tx *sql.Tx, tunnelID int64, groups []string) error {
+	for _, name := range groups {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM routing_groups WHERE name=?)`, name).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("routing group %q does not exist", name)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM tunnel_routing_groups WHERE tunnel_id=?`, tunnelID); err != nil {
+		return err
+	}
+	for _, name := range groups {
+		if _, err := tx.Exec(`INSERT INTO tunnel_routing_groups(tunnel_id,group_id) SELECT ?,id FROM routing_groups WHERE name=?`, tunnelID, name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -228,11 +334,14 @@ func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 		return e
 	}
 	defer tx.Rollback()
-	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,routing_group,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.RoutingGroup, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
+	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
 	if e != nil {
 		return e
 	}
 	t.ID, _ = r.LastInsertId()
+	if e = setTunnelRoutingGroupsTx(tx, t.ID, t.RoutingGroups); e != nil {
+		return e
+	}
 	if _, e = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'create',?,?,?)`, admin, t.ID, t.V6CIDR, now); e != nil {
 		return e
 	}
@@ -360,17 +469,97 @@ func (s *Store) SetTunnelQuota(id, quotaGiB int64, admin string) error {
 	}
 	return tx.Commit()
 }
-func (s *Store) SetTunnelRoutingGroup(id int64, group, admin string) error {
+func (s *Store) SetTunnelRoutingGroups(id int64, groups []string, admin string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`UPDATE tunnels SET routing_group=?,status='pending',updated_at=? WHERE id=?`, group, now, id); err != nil {
+	if err = setTunnelRoutingGroupsTx(tx, id, groups); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-group',?,?,?)`, admin, id, group, now); err != nil {
+	if _, err = tx.Exec(`UPDATE tunnels SET status='pending',updated_at=? WHERE id=?`, now, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-groups',?,?,?)`, admin, id, strings.Join(groups, ", "), now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) RoutingGroups() ([]RoutingGroup, error) {
+	rows, err := s.db.Query(`SELECT g.id,g.name,g.created_at,COUNT(trg.tunnel_id) FROM routing_groups g LEFT JOIN tunnel_routing_groups trg ON trg.group_id=g.id GROUP BY g.id,g.name,g.created_at ORDER BY g.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var groups []RoutingGroup
+	for rows.Next() {
+		var group RoutingGroup
+		var created string
+		if err = rows.Scan(&group.ID, &group.Name, &created, &group.TunnelCount); err != nil {
+			return nil, err
+		}
+		group.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+func (s *Store) CreateRoutingGroup(name, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`INSERT INTO routing_groups(name,created_at) VALUES(?,?)`, name, now); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return errors.New("routing group already exists")
+		}
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-group-create',NULL,?,?)`, admin, name, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) RenameRoutingGroup(id int64, name, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var oldName string
+	if err = tx.QueryRow(`SELECT name FROM routing_groups WHERE id=?`, id).Scan(&oldName); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE routing_groups SET name=? WHERE id=?`, name, id); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return errors.New("routing group already exists")
+		}
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-group-rename',NULL,?,?)`, admin, oldName+" -> "+name, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) DeleteRoutingGroup(id int64, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var name string
+	if err = tx.QueryRow(`SELECT name FROM routing_groups WHERE id=?`, id).Scan(&name); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM routing_groups WHERE id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'routing-group-delete',NULL,?,?)`, admin, name, now); err != nil {
 		return err
 	}
 	return tx.Commit()

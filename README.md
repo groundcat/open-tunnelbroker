@@ -93,10 +93,10 @@ Each tunnel also has a combined upload and download quota, measured in GiB and d
 The **Routing** page controls communication between tunnels:
 
 - **Isolated** is the secure default and installs no `wg0`-to-`wg0` forwarding rule.
-- **Same routing group** permits traffic only when both active tunnels have the same non-empty routing-group name. Group membership can be set while creating a tunnel or edited from its detail page.
+- **Shared managed group** permits traffic when two active tunnels share at least one group. The **Groups** page creates, renames, and deletes reusable tags; tunnel creation and detail pages assign zero, one, or multiple groups with a multi-select control.
 - **Any tunnel** permits all active tunnels to communicate.
 
-Group policy is rendered as nftables IPv6 interval sets containing delegated prefixes and IPv4 address sets containing internal addresses. Rules require both source and destination membership in the same set. WireGuard AllowedIPs continue to enforce source ownership, original addresses are preserved, and inter-tunnel packets never match an egress masquerade rule. Combined quota accounting charges the sender's upload and the recipient's download.
+Each managed group is rendered as an nftables IPv6 interval set containing delegated prefixes and an IPv4 address set containing internal addresses. Rules require both source and destination membership in the same set, so membership in multiple groups naturally grants the union of those relationships. WireGuard AllowedIPs continue to enforce source ownership, original addresses are preserved, and inter-tunnel packets never match an egress masquerade rule. Combined quota accounting charges the sender's upload and the recipient's download.
 
 Use **Test WARP outbound IP** to request `https://1.1.1.1/cdn-cgi/trace` through that exact source-policy path. The returned trace and test time are saved for the admin UI. Selecting native upstream NAT and WARP simultaneously is rejected.
 

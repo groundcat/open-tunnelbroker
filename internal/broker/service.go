@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,10 +191,30 @@ func validateRoutingGroup(group string) error {
 	return nil
 }
 
+func normalizeRoutingGroups(groups []string) ([]string, error) {
+	unique := make(map[string]bool, len(groups))
+	for _, group := range groups {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		if err := validateRoutingGroup(group); err != nil {
+			return nil, err
+		}
+		unique[group] = true
+	}
+	normalized := make([]string, 0, len(unique))
+	for group := range unique {
+		normalized = append(normalized, group)
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
 type CreateTunnelInput struct {
 	Label, PublicKey, DNS string
 	V4Mode                string
-	RoutingGroup          string
+	RoutingGroups         []string
 	Prefix                int
 	QuotaGiB              int64
 	GenerateKeys          bool
@@ -221,9 +242,9 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if err := validateQuota(in.QuotaGiB); err != nil {
 		return Tunnel{}, err
 	}
-	in.RoutingGroup = strings.TrimSpace(in.RoutingGroup)
-	if err := validateRoutingGroup(in.RoutingGroup); err != nil {
-		return Tunnel{}, err
+	in.RoutingGroups, e = normalizeRoutingGroups(in.RoutingGroups)
+	if e != nil {
+		return Tunnel{}, e
 	}
 	if in.V4Mode == V4ModeWarp {
 		account, accountErr := a.store.WarpAccount()
@@ -257,7 +278,7 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), RoutingGroup: in.RoutingGroup, Enabled: true}
+	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), RoutingGroups: in.RoutingGroups, Enabled: true}
 	t.V4Enabled = tunnelV4Mode(cfg, t) != V4ModeOff
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
@@ -331,17 +352,50 @@ func (a *App) SetTunnelQuota(id, quotaGiB int64, admin string) error {
 	}
 	return a.reconcileLocked(context.Background())
 }
-func (a *App) SetTunnelRoutingGroup(id int64, group, admin string) error {
+func (a *App) SetTunnelRoutingGroups(id int64, groups []string, admin string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	group = strings.TrimSpace(group)
-	if err := validateRoutingGroup(group); err != nil {
+	groups, err := normalizeRoutingGroups(groups)
+	if err != nil {
 		return err
 	}
 	if _, err := a.store.Tunnel(id); err != nil {
 		return err
 	}
-	if err := a.store.SetTunnelRoutingGroup(id, group, admin); err != nil {
+	if err := a.store.SetTunnelRoutingGroups(id, groups, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
+}
+func (a *App) CreateRoutingGroup(name, admin string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("routing group name is required")
+	}
+	if err := validateRoutingGroup(name); err != nil {
+		return err
+	}
+	return a.store.CreateRoutingGroup(name, admin)
+}
+func (a *App) RenameRoutingGroup(id int64, name, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("routing group name is required")
+	}
+	if err := validateRoutingGroup(name); err != nil {
+		return err
+	}
+	if err := a.store.RenameRoutingGroup(id, name, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
+}
+func (a *App) DeleteRoutingGroup(id int64, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.store.DeleteRoutingGroup(id, admin); err != nil {
 		return err
 	}
 	return a.reconcileLocked(context.Background())

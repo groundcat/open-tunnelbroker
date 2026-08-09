@@ -47,11 +47,27 @@ type Tunnel struct {
 	QuotaGiB, QuotaUsedBytes                                                                      int64
 	QuotaPeriod                                                                                   string
 	QuotaDisabled                                                                                 bool
-	RoutingGroup                                                                                  string
+	RoutingGroups                                                                                 []string
 	MTUOverride                                                                                   int
 	CreatedAt, UpdatedAt                                                                          time.Time
 	LastHandshake                                                                                 time.Time
 	RXBytes, TXBytes                                                                              int64
+}
+
+type RoutingGroup struct {
+	ID          int64
+	Name        string
+	TunnelCount int
+	CreatedAt   time.Time
+}
+
+func (t Tunnel) HasRoutingGroup(name string) bool {
+	for _, group := range t.RoutingGroups {
+		if group == name {
+			return true
+		}
+	}
+	return false
 }
 
 type Health struct {
