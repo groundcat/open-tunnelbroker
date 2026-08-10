@@ -48,7 +48,7 @@ jobs:
             -o dist/package/open-tunnelbroker ./cmd/open-tunnelbroker
           cp LICENSE README.md dist/package/
           tar -C dist/package -czf "dist/$archive" open-tunnelbroker LICENSE README.md
-          sha256sum "dist/$archive" > "dist/$archive.sha256"
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.goarch }}
