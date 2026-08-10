@@ -32,6 +32,15 @@ CGO_ENABLED=0 go build -trimpath -o bin/open-tunnelbroker ./cmd/open-tunnelbroke
 
 The equivalent `make test` and `make build VERSION=...` targets are provided when GNU Make is installed.
 
+## Releases
+
+Pushing a semantic version tag (for example, `v1.2.3`) to GitHub runs the test suite and creates a GitHub Release. Each release contains statically linked Linux archives for Debian/Ubuntu hosts on `amd64` and `arm64`, with SHA-256 checksum files. The executable reports the exact tag with `open-tunnelbroker -version`.
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
 ## Install
 
 1. Establish the provider connection first. Confirm the delegated prefix is routed to the VPS and note its egress interface (for example `ppp0`). Do not store provider credentials in this repository.
