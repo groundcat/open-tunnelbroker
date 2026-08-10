@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,12 +27,20 @@ func (f *fakeUpgrader) Start(context.Context) error {
 }
 
 func TestSystemUpgraderReportsConfiguredRepository(t *testing.T) {
-	repository, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
+	repository := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "--initial-branch=main", repository},
+		{"-C", repository, "config", "user.name", "test"},
+		{"-C", repository, "config", "user.email", "test@example.test"},
+		{"-C", repository, "commit", "--allow-empty", "-m", "initial commit"},
+		{"-C", repository, "remote", "add", "origin", "https://example.test/open-tunnelbroker.git"},
+	} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+		}
 	}
 	statusPath := filepath.Join(t.TempDir(), "status")
-	if err = os.WriteFile(statusPath, []byte("succeeded\ndeployed test revision\n"), 0600); err != nil {
+	if err := os.WriteFile(statusPath, []byte("succeeded\ndeployed test revision\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	upgrader := &SystemUpgrader{repository: repository, service: "test.service", statusPath: statusPath}
