@@ -35,7 +35,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), upstream_v6 TEXT NOT NULL DEFAULT '', upstream_v4 TEXT NOT NULL DEFAULT '', v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, interface_name TEXT NOT NULL DEFAULT 'wg0', server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, upstream_interface TEXT NOT NULL DEFAULT 'ppp0', inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated');
+CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), upstream_v6 TEXT NOT NULL DEFAULT '', upstream_v4 TEXT NOT NULL DEFAULT '', v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, interface_name TEXT NOT NULL DEFAULT 'wg0', server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, upstream_interface TEXT NOT NULL DEFAULT 'ppp0', inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated', upstream_mode TEXT NOT NULL DEFAULT 'routed', transport_address TEXT NOT NULL DEFAULT '');
 INSERT OR IGNORE INTO settings(id) VALUES(1);
 CREATE TABLE IF NOT EXISTS warp_account (id INTEGER PRIMARY KEY CHECK(id=1), private_key TEXT NOT NULL, peer_public_key TEXT NOT NULL, ipv4_address TEXT NOT NULL, endpoint TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', account_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_trace TEXT NOT NULL DEFAULT '', last_test_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash BLOB NOT NULL, created_at TEXT NOT NULL);
@@ -59,6 +59,8 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN quota_disabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE settings ADD COLUMN inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated'`,
+		`ALTER TABLE settings ADD COLUMN upstream_mode TEXT NOT NULL DEFAULT 'routed'`,
+		`ALTER TABLE settings ADD COLUMN transport_address TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
@@ -109,7 +111,10 @@ func (s *Store) migrateLegacyRoutingGroups() error {
 
 func (s *Store) Settings() (Settings, error) {
 	var v Settings
-	err := s.db.QueryRow(`SELECT upstream_v6,upstream_v4,v4_nat,v4_warp,v4_pool,default_dns,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface,inter_tunnel_policy FROM settings WHERE id=1`).Scan(&v.UpstreamV6, &v.UpstreamV4, &v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.EndpointHost, &v.EndpointPort, &v.InterfaceName, &v.ServerAddress, &v.ServerPrivateKey, &v.MTU, &v.Keepalive, &v.MinPrefix, &v.MaxPrefix, &v.DefaultPrefix, &v.UpstreamInterface, &v.InterTunnelPolicy)
+	err := s.db.QueryRow(`SELECT upstream_v6,upstream_v4,v4_nat,v4_warp,v4_pool,default_dns,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface,inter_tunnel_policy,upstream_mode,transport_address FROM settings WHERE id=1`).Scan(&v.UpstreamV6, &v.UpstreamV4, &v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.EndpointHost, &v.EndpointPort, &v.InterfaceName, &v.ServerAddress, &v.ServerPrivateKey, &v.MTU, &v.Keepalive, &v.MinPrefix, &v.MaxPrefix, &v.DefaultPrefix, &v.UpstreamInterface, &v.InterTunnelPolicy, &v.UpstreamMode, &v.TransportAddress)
+	if err == nil && !validUpstreamMode(v.UpstreamMode) {
+		v.UpstreamMode = UpstreamRouted
+	}
 	return v, err
 }
 func (s *Store) SaveSettings(v Settings) error {
@@ -127,7 +132,7 @@ func (s *Store) SaveSettings(v Settings) error {
 			return err
 		}
 	}
-	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=?,inter_tunnel_policy=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface, v.InterTunnelPolicy); err != nil {
+	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=?,inter_tunnel_policy=?,upstream_mode=?,transport_address=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface, v.InterTunnelPolicy, upstreamMode(v), v.TransportAddress); err != nil {
 		return err
 	}
 	return tx.Commit()

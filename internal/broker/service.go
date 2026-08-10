@@ -44,9 +44,19 @@ func New(path string, dry bool, logger *log.Logger) (*App, error) {
 	if e != nil {
 		return nil, e
 	}
-	return &App{store: s, kernel: &LinuxKernel{DryRun: dry}, logger: logger, sessions: map[string]session{}, httpClient: &http.Client{Timeout: 20 * time.Second}, warpAPIURL: defaultWarpAPIURL, upgrader: NewSystemUpgrader()}, nil
+	return &App{store: s, kernel: &LinuxKernel{DryRun: dry, Logger: logger}, logger: logger, sessions: map[string]session{}, httpClient: &http.Client{Timeout: 20 * time.Second}, warpAPIURL: defaultWarpAPIURL, upgrader: NewSystemUpgrader()}, nil
 }
-func (a *App) Close() error { return a.store.Close() }
+
+// Close stops kernel helpers and then the store. Kernel state that carries
+// traffic is intentionally left in place across restarts.
+func (a *App) Close() error {
+	kernelErr := a.kernel.Close()
+	storeErr := a.store.Close()
+	if storeErr != nil {
+		return storeErr
+	}
+	return kernelErr
+}
 func (a *App) BootstrapAdmin(user, password string) error {
 	n, e := a.store.AdminCount()
 	if e != nil {
@@ -81,26 +91,81 @@ func (a *App) SaveSettings(v Settings) error {
 	if v.InterTunnelPolicy == "" {
 		v.InterTunnelPolicy = InterTunnelIsolated
 	}
-	if e := validateSettings(v); e != nil {
+	v, e := normalizeSettings(v)
+	if e != nil {
+		return e
+	}
+	if e = validateSettings(v); e != nil {
 		return e
 	}
 	if v.V4Warp {
-		account, e := a.store.WarpAccount()
-		if e != nil {
-			return e
+		account, accountErr := a.store.WarpAccount()
+		if accountErr != nil {
+			return accountErr
 		}
 		if !account.Exists() {
 			return errors.New("create a Cloudflare WARP account before enabling WARP IPv4 egress")
 		}
 	}
 	if v.ServerPrivateKey == "" {
-		k, e := wgtypes.GeneratePrivateKey()
-		if e != nil {
-			return e
+		k, keyErr := wgtypes.GeneratePrivateKey()
+		if keyErr != nil {
+			return keyErr
 		}
 		v.ServerPrivateKey = k.String()
 	}
 	return a.store.SaveSettings(v)
+}
+
+// defaultTransportAddress numbers the WireGuard interface outside any delegated
+// prefix. It is used when the whole prefix goes downstream and therefore has no
+// room for an infrastructure address.
+const defaultTransportAddress = "fd00:6b72:6f6b::1/64"
+
+// normalizeSettings makes a delegation configuration self-consistent so that a
+// single-/64 upstream needs no manual per-tunnel work.
+//
+// A provider that hands this host exactly one /64 leaves no room to split off
+// an infrastructure subnet: SLAAC needs a full /64 on the downstream LAN. The
+// whole prefix is therefore delegated as one allocation, the WireGuard
+// transport is numbered from a ULA instead, and no part of the prefix is
+// reserved for the server.
+func normalizeSettings(v Settings) (Settings, error) {
+	upstream, err := netip.ParsePrefix(v.UpstreamV6)
+	if err != nil || !upstream.Addr().Is6() {
+		// Leave validation to report the real problem.
+		return v, nil
+	}
+	upstream = upstream.Masked()
+	v.UpstreamV6 = upstream.String()
+	if !validUpstreamMode(v.UpstreamMode) {
+		v.UpstreamMode = UpstreamRouted
+	}
+	// A prefix no larger than a single /64 cannot be subdivided for SLAAC, so
+	// the entire prefix becomes the one allocation size on offer.
+	if upstream.Bits() >= 64 {
+		v.MinPrefix, v.MaxPrefix, v.DefaultPrefix = upstream.Bits(), upstream.Bits(), upstream.Bits()
+	} else {
+		v.MinPrefix = min(max(v.MinPrefix, upstream.Bits()), 128)
+		v.MaxPrefix = min(max(v.MaxPrefix, v.MinPrefix), 128)
+		v.DefaultPrefix = min(max(v.DefaultPrefix, v.MinPrefix), v.MaxPrefix)
+	}
+	if v.UpstreamMode == UpstreamOnLink && v.TransportAddress == "" {
+		// The prefix is handed downstream in full, so the tunnel has to be
+		// numbered from somewhere else. A server address inside the prefix is
+		// rejected by validation rather than cleared here: silently dropping it
+		// would change an existing deployment's addressing without saying so.
+		v.TransportAddress = defaultTransportAddress
+	}
+	if v.TransportAddress != "" {
+		transport, transportErr := netip.ParsePrefix(v.TransportAddress)
+		if transportErr != nil {
+			return v, errors.New("WireGuard transport address must be an IPv6 CIDR")
+		}
+		// Keep the host bits: this is an interface address, not a route.
+		v.TransportAddress = transport.String()
+	}
+	return v, nil
 }
 
 func (a *App) ResetGeneralSettings(admin string) error {
@@ -117,6 +182,12 @@ func (a *App) ResetGeneralSettings(admin string) error {
 	minPrefix := max(upstream.Bits(), 48)
 	maxPrefix := max(minPrefix, 64)
 	defaultPrefix := min(max(56, minPrefix), maxPrefix)
+	if upstream.Bits() >= 64 {
+		// A single-/64 upstream has exactly one allocation size; normalization
+		// enforces this too, but computing it here keeps the audited values
+		// honest.
+		minPrefix, maxPrefix, defaultPrefix = upstream.Bits(), upstream.Bits(), upstream.Bits()
+	}
 	cfg.V4NAT = false
 	cfg.V4Warp = false
 	cfg.V4Pool = "10.99.0.0/16"
@@ -128,6 +199,11 @@ func (a *App) ResetGeneralSettings(admin string) error {
 	cfg.MaxPrefix = maxPrefix
 	cfg.DefaultPrefix = defaultPrefix
 	cfg.InterTunnelPolicy = InterTunnelIsolated
+	// Reset deliberately preserves the delegation mode and transport address:
+	// they describe how the provider hands over the prefix, not a preference.
+	if cfg, err = normalizeSettings(cfg); err != nil {
+		return err
+	}
 	if err = a.store.SaveSettings(cfg); err != nil {
 		return err
 	}
@@ -139,8 +215,28 @@ func validateSettings(v Settings) error {
 	if e != nil || !p.Addr().Is6() {
 		return errors.New("upstream IPv6 must be an IPv6 CIDR")
 	}
+	if !validUpstreamMode(upstreamMode(v)) {
+		return errors.New("invalid upstream delegation mode")
+	}
 	if v.MinPrefix < p.Bits() || v.MaxPrefix < v.MinPrefix || v.MaxPrefix > 128 || v.DefaultPrefix < v.MinPrefix || v.DefaultPrefix > v.MaxPrefix {
 		return errors.New("prefix limits must satisfy upstream <= min <= default <= max <= 128")
+	}
+	if v.TransportAddress != "" {
+		transport, transportErr := netip.ParsePrefix(v.TransportAddress)
+		if transportErr != nil || !transport.Addr().Is6() {
+			return errors.New("WireGuard transport address must be an IPv6 CIDR")
+		}
+		if p.Contains(transport.Addr()) {
+			return errors.New("WireGuard transport address must be outside the delegated prefix; use a ULA such as fd00:0:0:1::1/64")
+		}
+	}
+	if upstreamMode(v) == UpstreamOnLink {
+		if v.ServerAddress != "" {
+			return errors.New("on-link delegation hands the entire prefix downstream, so it cannot also reserve a server address: clear the server address field")
+		}
+		if v.TransportAddress == "" {
+			return errors.New("on-link delegation requires a WireGuard transport address outside the delegated prefix, such as fd00:0:0:1::1/64")
+		}
 	}
 	if v.EndpointHost == "" {
 		return errors.New("endpoint hostname or address is required")
@@ -265,13 +361,8 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	if cfg.ServerAddress != "" {
-		s := netip.MustParsePrefix(cfg.ServerAddress)
-		reserveBits := cfg.MaxPrefix
-		if s.Bits() < reserveBits {
-			s = netip.PrefixFrom(s.Addr(), reserveBits).Masked()
-		}
-		used = append(used, s)
+	if reserved, ok := serverReservation(cfg); ok {
+		used = append(used, reserved)
 	}
 	pool := netip.MustParsePrefix(cfg.UpstreamV6)
 	alloc, e := Allocate(pool, used, in.Prefix)
@@ -552,7 +643,18 @@ func (a *App) ClientConfig(t Tunnel, cfg Settings) string {
 	if dns == "" {
 		dns = cfg.DefaultDNS
 	}
-	address := firstUsable(netip.MustParsePrefix(t.V6CIDR)).String() + "/" + fmt.Sprint(netip.MustParsePrefix(t.V6CIDR).Bits())
+	delegated := netip.MustParsePrefix(t.V6CIDR)
+	// The whole delegated prefix is handed to the client's LAN when it is a
+	// single /64, because SLAAC needs a full /64 there. The tunnel interface is
+	// then numbered from the transport range instead, leaving the prefix free.
+	// Otherwise the tunnel keeps its historical address inside the prefix.
+	notes := ""
+	address := firstUsable(delegated).String() + "/" + fmt.Sprint(delegated.Bits())
+	if client, ok := clientTransportAddress(cfg, t); ok {
+		transport, _ := transportPrefix(cfg)
+		address = client.String() + "/" + fmt.Sprint(transport.Bits())
+		notes = fmt.Sprintf("# Routed to this peer: %s\n# Put that prefix on the LAN and advertise it there (OpenWrt: RA server, DHCPv6 server, NDP disabled).\n# Do not add it to this interface: the LAN needs the whole /64 for SLAAC.\n", delegated)
+	}
 	if tunnelIPv4Enabled(cfg, t) {
 		address += ", " + t.V4Address + "/32"
 	}
@@ -565,7 +667,40 @@ func (a *App) ClientConfig(t Tunnel, cfg Settings) string {
 		pub = k.PublicKey().String()
 	}
 	endpoint := net.JoinHostPort(cfg.EndpointHost, strconv.Itoa(cfg.EndpointPort))
-	return fmt.Sprintf("[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %d\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = %s\nPersistentKeepalive = %d\n", priv, address, dns, chooseMTU(t, cfg), pub, t.PresharedKey, endpoint, allowed, cfg.Keepalive)
+	return fmt.Sprintf("%s[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %d\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = %s\nPersistentKeepalive = %d\n", notes, priv, address, dns, chooseMTU(t, cfg), pub, t.PresharedKey, endpoint, allowed, cfg.Keepalive)
+}
+
+// clientTransportAddress derives this tunnel's address inside the WireGuard
+// transport range. It is used when the tunnel cannot take an address from its
+// own delegated prefix because that prefix goes to the client's LAN in full.
+// The value is derived from the tunnel ID so that it is stable and needs no
+// separate allocation or manual step.
+func clientTransportAddress(cfg Settings, t Tunnel) (netip.Addr, bool) {
+	transport, ok := transportPrefix(cfg)
+	if !ok || upstreamMode(cfg) != UpstreamOnLink || t.ID <= 0 {
+		return netip.Addr{}, false
+	}
+	candidate := offsetAddr(transport.Masked().Addr(), uint64(t.ID)+1)
+	// The server holds one address in this range; step past it rather than
+	// duplicating it.
+	if candidate == transport.Addr() {
+		candidate = offsetAddr(candidate, 1)
+	}
+	if !transport.Contains(candidate) {
+		return netip.Addr{}, false
+	}
+	return candidate, true
+}
+
+func offsetAddr(base netip.Addr, offset uint64) netip.Addr {
+	value := base.As16()
+	carry := offset
+	for i := 15; i >= 0 && carry > 0; i-- {
+		sum := uint64(value[i]) + carry&0xff
+		value[i] = byte(sum)
+		carry = carry>>8 + sum>>8
+	}
+	return netip.AddrFrom16(value)
 }
 func firstUsable(p netip.Prefix) netip.Addr {
 	if p.Bits() == p.Addr().BitLen() {

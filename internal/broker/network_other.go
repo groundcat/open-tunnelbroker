@@ -5,6 +5,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"log"
 )
 
 type Kernel interface {
@@ -12,8 +13,14 @@ type Kernel interface {
 	Inspect(Settings, WarpAccount, []Tunnel) ([]string, error)
 	Remove(Settings, Tunnel) error
 	TestWarp(context.Context, Settings, WarpAccount) (string, error)
+	Close() error
 }
-type LinuxKernel struct{ DryRun bool }
+type LinuxKernel struct {
+	DryRun bool
+	Logger *log.Logger
+}
+
+func (k *LinuxKernel) Close() error { return nil }
 
 func (k *LinuxKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, t []Tunnel) ([]Tunnel, error) {
 	if k.DryRun {

@@ -21,6 +21,7 @@ type fakeKernel struct {
 	applied  []Tunnel
 	traffic  map[int64][2]int64
 	applyN   int
+	closed   bool
 }
 
 func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
@@ -38,6 +39,7 @@ func (f *fakeKernel) Inspect(_ Settings, _ WarpAccount, _ []Tunnel) ([]string, e
 	return nil, nil
 }
 func (f *fakeKernel) Remove(_ Settings, _ Tunnel) error { return nil }
+func (f *fakeKernel) Close() error                      { f.closed = true; return nil }
 func (f *fakeKernel) TestWarp(_ context.Context, _ Settings, _ WarpAccount) (string, error) {
 	return "fl=1\nip=203.0.113.8\nwarp=on\n", nil
 }

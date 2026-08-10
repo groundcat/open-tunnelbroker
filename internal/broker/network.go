@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -24,13 +27,54 @@ type Kernel interface {
 	Inspect(Settings, WarpAccount, []Tunnel) ([]string, error)
 	Remove(Settings, Tunnel) error
 	TestWarp(context.Context, Settings, WarpAccount) (string, error)
+	Close() error
 }
-type LinuxKernel struct{ DryRun bool }
+type LinuxKernel struct {
+	DryRun bool
+	Logger *log.Logger
+
+	ndpOnce sync.Once
+	ndp     *ndpResponder
+}
 
 const (
 	warpRouteTable   = 51822
 	warpRulePriority = 90
+
+	// Tunnel routes are installed with a better metric than the kernel's
+	// connected route, which IPv6 creates at metric 256. On an on-link
+	// upstream a tunnel may be delegated the entire prefix, producing a route
+	// of exactly the connected route's length, where only the metric decides.
+	tunnelRouteMetric = 128
+
+	// A gateway inside a delegated prefix is pinned to the upstream interface
+	// at a longer prefix than any tunnel route, so delegating the whole prefix
+	// downstream can never strand the host's own default route.
+	gatewayRouteMetric = 64
 )
+
+// responder returns the lazily created Neighbor Discovery proxy, so a kernel
+// value stays usable when constructed directly.
+func (k *LinuxKernel) responder() *ndpResponder {
+	k.ndpOnce.Do(func() {
+		logger := k.Logger
+		if logger == nil {
+			logger = log.New(io.Discard, "", 0)
+		}
+		k.ndp = newNDPResponder(logger)
+	})
+	return k.ndp
+}
+
+// Close stops the Neighbor Discovery proxy. Routes, peers, and nftables rules
+// are deliberately left in place so that a restart does not interrupt traffic.
+func (k *LinuxKernel) Close() error {
+	if k.DryRun {
+		return nil
+	}
+	k.responder().Close()
+	return nil
+}
 
 func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
 	if k.DryRun {
@@ -53,13 +97,19 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 	} else if err != nil {
 		return nil, err
 	}
-	if cfg.ServerAddress != "" {
-		p, e := netip.ParsePrefix(cfg.ServerAddress)
+	// The tunnel interface is numbered from the delegated prefix when the
+	// provider routes it, and from a separate transport range when the whole
+	// prefix is handed downstream instead.
+	tunnelAddress := cfg.ServerAddress
+	if transport, ok := transportPrefix(cfg); ok && upstreamMode(cfg) == UpstreamOnLink {
+		tunnelAddress = transport.String()
+	}
+	if tunnelAddress != "" {
+		p, e := netip.ParsePrefix(tunnelAddress)
 		if e != nil {
-			return nil, fmt.Errorf("server address: %w", e)
+			return nil, fmt.Errorf("tunnel interface address: %w", e)
 		}
-		upstream, e := netip.ParsePrefix(cfg.UpstreamV6)
-		if e != nil {
+		if _, e = netip.ParsePrefix(cfg.UpstreamV6); e != nil {
 			return nil, fmt.Errorf("upstream prefix: %w", e)
 		}
 		addresses, e := netlink.AddrList(link, netlink.FAMILY_V6)
@@ -68,7 +118,13 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 		}
 		for _, existing := range addresses {
 			addr, ok := netip.AddrFromSlice(existing.IP)
-			if ok && upstream.Contains(addr) && addr != p.Addr() {
+			// The tunnel interface is owned entirely by this application, so
+			// every routable address other than the configured one is stale.
+			// This is what clears an address left inside the delegated prefix
+			// after a switch to on-link delegation, where the whole prefix
+			// belongs to downstream tunnels. Kernel link-local addresses are
+			// left alone because Neighbor Discovery needs them.
+			if ok && addr != p.Addr() && !addr.IsLinkLocalUnicast() {
 				if e = netlink.AddrDel(link, &existing); e != nil {
 					return nil, e
 				}
@@ -102,10 +158,9 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 		if e != nil {
 			return nil, fmt.Errorf("tunnel %d public key: %w", t.ID, e)
 		}
-		pc := wgtypes.PeerConfig{PublicKey: pub, ReplaceAllowedIPs: true, AllowedIPs: []net.IPNet{*prefixIPNet(netip.MustParsePrefix(t.V6CIDR))}}
-		if tunnelIPv4Enabled(cfg, t) {
-			a := netip.MustParseAddr(t.V4Address)
-			pc.AllowedIPs = append(pc.AllowedIPs, *prefixIPNet(netip.PrefixFrom(a, 32)))
+		pc := wgtypes.PeerConfig{PublicKey: pub, ReplaceAllowedIPs: true}
+		for _, allowed := range tunnelAllowedIPs(cfg, t) {
+			pc.AllowedIPs = append(pc.AllowedIPs, *prefixIPNet(allowed))
 		}
 		if t.PresharedKey != "" {
 			psk, e := wgtypes.ParseKey(t.PresharedKey)
@@ -133,9 +188,14 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 	if err != nil {
 		return nil, err
 	}
+	// On an on-link upstream, tunnel routes can cover the addresses the host
+	// needs to reach its own router, so those are pinned upstream first.
+	if err = k.pinUpstreamNeighbors(cfg); err != nil {
+		return nil, err
+	}
 	for i, t := range tunnels {
 		p := netip.MustParsePrefix(t.V6CIDR)
-		v6Route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(p), Protocol: 0x42}
+		v6Route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(p), Protocol: 0x42, Priority: tunnelRouteMetric}
 		if t.Enabled {
 			if err = netlink.RouteReplace(v6Route); err != nil {
 				return nil, err
@@ -174,6 +234,9 @@ func (k *LinuxKernel) Apply(ctx context.Context, cfg Settings, warp WarpAccount,
 		return tunnels, err
 	}
 	if err = k.applyNAT(ctx, cfg, tunnels); err != nil {
+		return tunnels, err
+	}
+	if err = k.applyNDPProxy(cfg, tunnels); err != nil {
 		return tunnels, err
 	}
 	return tunnels, nil
@@ -219,9 +282,9 @@ func (k *LinuxKernel) Inspect(cfg Settings, warp WarpAccount, tunnels []Tunnel) 
 			drift = append(drift, fmt.Sprintf("tunnel %d peer is missing", t.ID))
 			continue
 		}
-		expected := map[string]bool{netip.MustParsePrefix(t.V6CIDR).String(): true}
-		if tunnelIPv4Enabled(cfg, t) {
-			expected[t.V4Address+"/32"] = true
+		expected := map[string]bool{}
+		for _, allowed := range tunnelAllowedIPs(cfg, t) {
+			expected[allowed.String()] = true
 		}
 		if len(peer.AllowedIPs) != len(expected) {
 			drift = append(drift, fmt.Sprintf("tunnel %d AllowedIPs differ", t.ID))
@@ -301,6 +364,22 @@ func (k *LinuxKernel) Inspect(cfg Settings, warp WarpAccount, tunnels []Tunnel) 
 			drift = append(drift, "Cloudflare WARP policy route is missing")
 		}
 	}
+	if upstreamMode(cfg) == UpstreamOnLink {
+		local, localErr := upstreamLocalAddresses(cfg.UpstreamInterface)
+		if localErr != nil {
+			return nil, localErr
+		}
+		expected := ndpProxySetFor(cfg, tunnels, local)
+		name, current, running := k.responder().state()
+		switch {
+		case expected.empty() && running:
+			drift = append(drift, "Neighbor Discovery proxy is running with no delegated prefix")
+		case !expected.empty() && !running:
+			drift = append(drift, "Neighbor Discovery proxy is not running for the on-link upstream")
+		case running && (name != cfg.UpstreamInterface || !current.equal(expected)):
+			drift = append(drift, "Neighbor Discovery proxy does not match the delegated prefixes")
+		}
+	}
 	return drift, nil
 }
 
@@ -310,7 +389,7 @@ func (k *LinuxKernel) Remove(cfg Settings, t Tunnel) error {
 	}
 	link, e := netlink.LinkByName(cfg.InterfaceName)
 	if e == nil {
-		_ = netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.MustParsePrefix(t.V6CIDR))})
+		_ = netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.MustParsePrefix(t.V6CIDR)), Priority: tunnelRouteMetric})
 		if t.V4Address != "" {
 			a := netip.MustParseAddr(t.V4Address)
 			_ = netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.PrefixFrom(a, 32))})
@@ -507,6 +586,81 @@ func (k *LinuxKernel) TestWarp(ctx context.Context, cfg Settings, account WarpAc
 		return "", errors.New("Cloudflare trace did not report an outbound IP")
 	}
 	return trace + "\n", nil
+}
+
+// applyNDPProxy reconciles the Neighbor Discovery proxy with the delegated
+// prefixes. It also enables the kernel's own proxy_ndp and forwarding flags on
+// the upstream interface, because a proxied advertisement is only useful if the
+// host then forwards the traffic it attracts.
+func (k *LinuxKernel) applyNDPProxy(cfg Settings, tunnels []Tunnel) error {
+	responder := k.responder()
+	if upstreamMode(cfg) != UpstreamOnLink {
+		responder.Close()
+		return nil
+	}
+	if cfg.UpstreamInterface == "" {
+		return errors.New("on-link delegation requires an upstream interface")
+	}
+	local, err := upstreamLocalAddresses(cfg.UpstreamInterface)
+	if err != nil {
+		return fmt.Errorf("neighbor discovery proxy: read upstream addresses: %w", err)
+	}
+	for _, setting := range []string{"forwarding", "proxy_ndp"} {
+		if err = writeSysctl(fmt.Sprintf("net/ipv6/conf/%s/%s", cfg.UpstreamInterface, setting), "1"); err != nil {
+			return fmt.Errorf("neighbor discovery proxy: %w", err)
+		}
+	}
+	return responder.Configure(cfg.UpstreamInterface, ndpProxySetFor(cfg, tunnels, local))
+}
+
+// pinUpstreamNeighbors keeps the host's upstream router reachable when a tunnel
+// route covers the address used to reach it. Each on-link next hop inside the
+// delegated prefix gets a /128 route out of the upstream interface, which is
+// always more specific than a tunnel's prefix route.
+func (k *LinuxKernel) pinUpstreamNeighbors(cfg Settings) error {
+	if upstreamMode(cfg) != UpstreamOnLink || cfg.UpstreamInterface == "" {
+		return nil
+	}
+	upstream, err := netip.ParsePrefix(cfg.UpstreamV6)
+	if err != nil {
+		return nil
+	}
+	link, err := netlink.LinkByName(cfg.UpstreamInterface)
+	if err != nil {
+		return fmt.Errorf("upstream interface %s: %w", cfg.UpstreamInterface, err)
+	}
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V6)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		gateway, ok := netip.AddrFromSlice(route.Gw)
+		if !ok || route.LinkIndex != link.Attrs().Index {
+			continue
+		}
+		gateway = gateway.Unmap()
+		if !upstream.Masked().Contains(gateway) {
+			continue
+		}
+		pinned := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixIPNet(netip.PrefixFrom(gateway, 128)), Protocol: 0x42, Priority: gatewayRouteMetric}
+		if err = netlink.RouteReplace(pinned); err != nil {
+			return fmt.Errorf("pin upstream gateway %s: %w", gateway, err)
+		}
+	}
+	return nil
+}
+
+// writeSysctl sets one kernel networking flag, treating an already-correct
+// value as success so that a read-only sysctl path is not a hard failure.
+func writeSysctl(path, value string) error {
+	full := "/proc/sys/" + path
+	if current, err := os.ReadFile(full); err == nil && strings.TrimSpace(string(current)) == value {
+		return nil
+	}
+	if err := os.WriteFile(full, []byte(value+"\n"), 0o644); err != nil {
+		return fmt.Errorf("set %s=%s: %w", path, value, err)
+	}
+	return nil
 }
 
 func (k *LinuxKernel) applyNAT(ctx context.Context, cfg Settings, tunnels []Tunnel) error {
