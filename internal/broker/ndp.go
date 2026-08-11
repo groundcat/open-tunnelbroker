@@ -195,19 +195,18 @@ func (s ndpProxySet) equal(other ndpProxySet) bool {
 	return true
 }
 
-// ndpProxySetFor collects the prefixes to proxy for the supplied tunnels. It
-// returns an empty set unless the upstream is on-link, because a routed prefix
+// ndpProxySetFor collects the prefixes to proxy for one upstream's tunnels. It
+// returns an empty set unless that upstream is on-link, because a routed prefix
 // needs no Neighbor Discovery help at all. Disabled tunnels are excluded so
 // that turning a tunnel off also stops attracting its traffic.
-func ndpProxySetFor(cfg Settings, tunnels []Tunnel, local []netip.Addr) ndpProxySet {
-	if upstreamMode(cfg) != UpstreamOnLink {
+func ndpProxySetFor(up Upstream, tunnels []Tunnel, local []netip.Addr) ndpProxySet {
+	if upstreamMode(up) != UpstreamOnLink {
 		return ndpProxySet{}
 	}
-	upstream, err := netip.ParsePrefix(cfg.UpstreamV6)
-	if err != nil {
+	upstream, ok := delegatedPrefix(up)
+	if !ok {
 		return ndpProxySet{}
 	}
-	upstream = upstream.Masked()
 	set := ndpProxySet{}
 	for _, tunnel := range tunnels {
 		if !tunnel.Enabled {
@@ -219,17 +218,49 @@ func ndpProxySetFor(cfg Settings, tunnels []Tunnel, local []netip.Addr) ndpProxy
 		}
 		set.Delegated = append(set.Delegated, prefix.Masked())
 	}
-	sort.Slice(set.Delegated, func(i, j int) bool {
-		if set.Delegated[i].Addr() != set.Delegated[j].Addr() {
-			return set.Delegated[i].Addr().Less(set.Delegated[j].Addr())
-		}
-		return set.Delegated[i].Bits() < set.Delegated[j].Bits()
-	})
 	for _, address := range local {
 		if address.Is6() && upstream.Contains(address) {
 			set.Local = append(set.Local, address)
 		}
 	}
-	sort.Slice(set.Local, func(i, j int) bool { return set.Local[i].Less(set.Local[j]) })
+	set.sort()
 	return set
+}
+
+func (s *ndpProxySet) sort() {
+	sort.Slice(s.Delegated, func(i, j int) bool {
+		if s.Delegated[i].Addr() != s.Delegated[j].Addr() {
+			return s.Delegated[i].Addr().Less(s.Delegated[j].Addr())
+		}
+		return s.Delegated[i].Bits() < s.Delegated[j].Bits()
+	})
+	sort.Slice(s.Local, func(i, j int) bool { return s.Local[i].Less(s.Local[j]) })
+}
+
+// merge folds another set into this one, which is how two on-link upstreams
+// that share one egress interface end up behind a single listener.
+func (s *ndpProxySet) merge(other ndpProxySet) {
+	s.Delegated = append(s.Delegated, other.Delegated...)
+	s.Local = append(s.Local, other.Local...)
+	s.sort()
+}
+
+// ndpProxySetsFor maps each egress interface to the addresses this host answers
+// Neighbor Discovery for there. Only on-link upstreams contribute, and an
+// interface shared by several of them carries the union of their prefixes.
+func ndpProxySetsFor(upstreams []Upstream, tunnels map[int64][]Tunnel, local map[string][]netip.Addr) map[string]ndpProxySet {
+	sets := make(map[string]ndpProxySet)
+	for _, upstream := range upstreams {
+		if upstreamMode(upstream) != UpstreamOnLink || upstream.EgressInterface == "" {
+			continue
+		}
+		set := ndpProxySetFor(upstream, tunnels[upstream.ID], local[upstream.EgressInterface])
+		if set.empty() {
+			continue
+		}
+		existing := sets[upstream.EgressInterface]
+		existing.merge(set)
+		sets[upstream.EgressInterface] = existing
+	}
+	return sets
 }

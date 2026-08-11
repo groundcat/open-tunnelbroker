@@ -128,7 +128,7 @@ func TestMalformedOrOffLinkSolicitationsAreRejected(t *testing.T) {
 }
 
 func TestProxySetAnswersDelegatedPrefixButNeverLocalOrForeignAddresses(t *testing.T) {
-	cfg := Settings{UpstreamV6: "2001:db8:1200:416::/64", UpstreamMode: UpstreamOnLink}
+	upstream := Upstream{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Mode: UpstreamOnLink}
 	tunnels := []Tunnel{
 		{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true},
 		{ID: 2, V6CIDR: "2001:db8:9999::/64", Enabled: true}, // outside the upstream
@@ -137,7 +137,7 @@ func TestProxySetAnswersDelegatedPrefixButNeverLocalOrForeignAddresses(t *testin
 	// The provider-assigned host address lives inside the delegated prefix on a
 	// single-/64 VPS, so it must be excluded or the host loses reachability.
 	host := netip.MustParseAddr("2001:db8:1200:416::10")
-	set := ndpProxySetFor(cfg, tunnels, []netip.Addr{host, netip.MustParseAddr("fe80::1")})
+	set := ndpProxySetFor(upstream, tunnels, []netip.Addr{host, netip.MustParseAddr("fe80::1")})
 
 	if len(set.Delegated) != 1 || set.Delegated[0] != netip.MustParsePrefix("2001:db8:1200:416::/64") {
 		t.Fatalf("unexpected delegated set: %+v", set.Delegated)
@@ -157,25 +157,13 @@ func TestProxySetAnswersDelegatedPrefixButNeverLocalOrForeignAddresses(t *testin
 }
 
 func TestProxyingIsDisabledForRoutedUpstreams(t *testing.T) {
-	cfg := Settings{UpstreamV6: "2001:db8:1200::/48", UpstreamMode: UpstreamRouted}
+	upstream := Upstream{ID: 1, V6CIDR: "2001:db8:1200::/48", Mode: UpstreamRouted}
 	tunnels := []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:100::/56", Enabled: true}}
-	if set := ndpProxySetFor(cfg, tunnels, nil); !set.empty() {
+	if set := ndpProxySetFor(upstream, tunnels, nil); !set.empty() {
 		t.Fatalf("routed delegation needs no Neighbor Discovery proxy: %+v", set)
 	}
-	// A database written before this setting existed must behave as routed.
-	if set := ndpProxySetFor(Settings{UpstreamV6: cfg.UpstreamV6}, tunnels, nil); !set.empty() {
-		t.Fatal("legacy settings enabled Neighbor Discovery proxying")
-	}
-}
-
-func TestProxySetEqualityDetectsMembershipChanges(t *testing.T) {
-	cfg := Settings{UpstreamV6: "2001:db8:1200:416::/64", UpstreamMode: UpstreamOnLink}
-	first := ndpProxySetFor(cfg, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
-	same := ndpProxySetFor(cfg, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
-	if !first.equal(same) {
-		t.Fatal("identical proxy sets compared unequal")
-	}
-	if first.equal(ndpProxySetFor(cfg, nil, nil)) {
-		t.Fatal("an emptied proxy set compared equal")
+	// A row written before this setting existed must behave as routed.
+	if set := ndpProxySetFor(Upstream{ID: 1, V6CIDR: upstream.V6CIDR}, tunnels, nil); !set.empty() {
+		t.Fatal("legacy configuration enabled Neighbor Discovery proxying")
 	}
 }

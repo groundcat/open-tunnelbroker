@@ -87,15 +87,13 @@ func token() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+func (a *App) Settings() (Settings, error) { return a.store.Settings() }
+
 func (a *App) SaveSettings(v Settings) error {
 	if v.InterTunnelPolicy == "" {
 		v.InterTunnelPolicy = InterTunnelIsolated
 	}
-	v, e := normalizeSettings(v)
-	if e != nil {
-		return e
-	}
-	if e = validateSettings(v); e != nil {
+	if e := validateSettings(v); e != nil {
 		return e
 	}
 	if v.V4Warp {
@@ -107,22 +105,230 @@ func (a *App) SaveSettings(v Settings) error {
 			return errors.New("create a Cloudflare WARP account before enabling WARP IPv4 egress")
 		}
 	}
-	if v.ServerPrivateKey == "" {
-		k, keyErr := wgtypes.GeneratePrivateKey()
-		if keyErr != nil {
-			return keyErr
-		}
-		v.ServerPrivateKey = k.String()
-	}
 	return a.store.SaveSettings(v)
 }
 
-// defaultTransportAddress numbers the WireGuard interface outside any delegated
-// prefix. It is used when the whole prefix goes downstream and therefore has no
-// room for an infrastructure address.
-const defaultTransportAddress = "fd00:6b72:6f6b::1/64"
+func validateSettings(v Settings) error {
+	if v.V4NAT && v.V4Warp {
+		return errors.New("native IPv4 NAT and Cloudflare WARP IPv4 egress cannot be enabled together")
+	}
+	if v.V4NAT || v.V4Warp {
+		pool, err := netip.ParsePrefix(v.V4Pool)
+		if err != nil || !pool.Addr().Is4() {
+			return errors.New("v4 pool must be an IPv4 CIDR")
+		}
+	}
+	if !validInterTunnelPolicy(v.InterTunnelPolicy) {
+		return errors.New("invalid inter-tunnel routing policy")
+	}
+	return nil
+}
 
-// normalizeSettings makes a delegation configuration self-consistent so that a
+func (a *App) ResetGeneralSettings(admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, err := a.store.Settings()
+	if err != nil {
+		return err
+	}
+	cfg.V4NAT = false
+	cfg.V4Warp = false
+	cfg.V4Pool = "10.99.0.0/16"
+	cfg.DefaultDNS = "2606:4700:4700::1111"
+	cfg.InterTunnelPolicy = InterTunnelIsolated
+	if err = a.store.SaveSettings(cfg); err != nil {
+		return err
+	}
+	_ = a.store.AddAudit(admin, "settings-reset", "general defaults restored")
+	return a.reconcileLocked(context.Background())
+}
+
+// defaultTransportAddress numbers a WireGuard interface outside any delegated
+// prefix. It is used when the whole prefix goes downstream and therefore has no
+// room for an infrastructure address. Each upstream needs its own range, so the
+// first ULA subnet not already claimed by another upstream is chosen.
+const defaultTransportPrefix = "fd00:6b72:6f6b:%x::1/64"
+
+func defaultTransportAddress(others []Upstream) string {
+	taken := make(map[string]bool, len(others))
+	for _, other := range others {
+		if transport, ok := transportPrefix(other); ok {
+			taken[transport.Masked().String()] = true
+		}
+	}
+	for index := 0; index < 0x10000; index++ {
+		candidate := fmt.Sprintf(defaultTransportPrefix, index)
+		prefix, err := netip.ParsePrefix(candidate)
+		if err != nil {
+			continue
+		}
+		if !taken[prefix.Masked().String()] {
+			return candidate
+		}
+	}
+	return fmt.Sprintf(defaultTransportPrefix, 0)
+}
+
+// othersExcept drops the upstream being edited from a list, so that its own
+// current values never count as a conflict with itself.
+func othersExcept(upstreams []Upstream, id int64) []Upstream {
+	others := make([]Upstream, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		if upstream.ID != id {
+			others = append(others, upstream)
+		}
+	}
+	return others
+}
+
+func (a *App) Upstreams() ([]Upstream, error) { return a.store.Upstreams() }
+func (a *App) Upstream(id int64) (Upstream, error) {
+	return a.store.Upstream(id)
+}
+
+// UpstreamInput carries the editable fields of one provider connection.
+type UpstreamInput struct {
+	ID                                  int64
+	Name                                string
+	V6CIDR                              string
+	Mode                                string
+	PublicV4                            string
+	EgressInterface                     string
+	InterfaceName                       string
+	EndpointHost                        string
+	EndpointPort                        int
+	ServerAddress                       string
+	TransportAddress                    string
+	MTU, Keepalive                      int
+	MinPrefix, MaxPrefix, DefaultPrefix int
+	V4Mode                              string
+}
+
+func (in UpstreamInput) apply(existing Upstream) Upstream {
+	existing.Name = strings.TrimSpace(in.Name)
+	existing.V6CIDR = strings.TrimSpace(in.V6CIDR)
+	existing.Mode = strings.TrimSpace(in.Mode)
+	existing.PublicV4 = strings.TrimSpace(in.PublicV4)
+	existing.EgressInterface = strings.TrimSpace(in.EgressInterface)
+	existing.InterfaceName = strings.TrimSpace(in.InterfaceName)
+	existing.EndpointHost = strings.TrimSpace(in.EndpointHost)
+	existing.EndpointPort = in.EndpointPort
+	existing.ServerAddress = strings.TrimSpace(in.ServerAddress)
+	existing.TransportAddress = strings.TrimSpace(in.TransportAddress)
+	existing.MTU = in.MTU
+	existing.Keepalive = in.Keepalive
+	existing.MinPrefix, existing.MaxPrefix, existing.DefaultPrefix = in.MinPrefix, in.MaxPrefix, in.DefaultPrefix
+	existing.V4Mode = in.V4Mode
+	return existing
+}
+
+func (a *App) CreateUpstream(in UpstreamInput, admin string) (Upstream, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	upstream := in.apply(Upstream{MTU: 1420, Keepalive: 25, MinPrefix: 48, MaxPrefix: 64, DefaultPrefix: 56, EndpointPort: 51820})
+	upstream, err := a.prepareUpstream(upstream, nil)
+	if err != nil {
+		return Upstream{}, err
+	}
+	if err = a.store.InsertUpstream(&upstream, admin); err != nil {
+		return Upstream{}, err
+	}
+	if err = a.reconcileLocked(context.Background()); err != nil {
+		return upstream, fmt.Errorf("upstream saved but apply failed: %w", err)
+	}
+	return a.store.Upstream(upstream.ID)
+}
+
+func (a *App) UpdateUpstream(in UpstreamInput, admin string) (Upstream, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	existing, err := a.store.Upstream(in.ID)
+	if err != nil {
+		return Upstream{}, err
+	}
+	previousInterface := existing.InterfaceName
+	updated, err := a.prepareUpstream(in.apply(existing), nil)
+	if err != nil {
+		return Upstream{}, err
+	}
+	tunnels, err := a.store.TunnelsForUpstream(updated.ID)
+	if err != nil {
+		return Upstream{}, err
+	}
+	if err = validateUpstreamAgainstTunnels(updated, tunnels); err != nil {
+		return Upstream{}, err
+	}
+	if err = a.store.UpdateUpstream(updated, admin); err != nil {
+		return Upstream{}, err
+	}
+	// A renamed WireGuard interface leaves the old device behind, still holding
+	// peers and routes, so it is torn down explicitly.
+	if previousInterface != updated.InterfaceName {
+		stale := existing
+		stale.InterfaceName = previousInterface
+		if err = a.kernel.RemoveUpstream(stale); err != nil {
+			return updated, fmt.Errorf("upstream saved but the previous interface %s could not be removed: %w", previousInterface, err)
+		}
+	}
+	if err = a.reconcileLocked(context.Background()); err != nil {
+		return updated, fmt.Errorf("upstream saved but apply failed: %w", err)
+	}
+	return a.store.Upstream(updated.ID)
+}
+
+func (a *App) DeleteUpstream(id int64, admin string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	upstream, err := a.store.Upstream(id)
+	if err != nil {
+		return err
+	}
+	if upstream.TunnelCount > 0 {
+		return fmt.Errorf("upstream %q still has %d tunnel(s); delete them first", upstream.Name, upstream.TunnelCount)
+	}
+	// Kernel state is removed before the row, because the row is what a later
+	// reconciliation would use to find this interface again. Dropping it first
+	// and then failing would leak the device and its policy table permanently.
+	if err = a.kernel.RemoveUpstream(upstream); err != nil {
+		return fmt.Errorf("upstream not deleted because its interface could not be removed: %w", err)
+	}
+	if err = a.store.DeleteUpstream(id, admin); err != nil {
+		return err
+	}
+	return a.reconcileLocked(context.Background())
+}
+
+// prepareUpstream normalizes and validates one provider connection, generating
+// its server key on first use. Uniqueness is checked against every other
+// upstream, because two connections that share an interface, a listening
+// endpoint, or overlapping address space would silently fight in the kernel.
+func (a *App) prepareUpstream(upstream Upstream, others []Upstream) (Upstream, error) {
+	var err error
+	if others == nil {
+		if others, err = a.store.Upstreams(); err != nil {
+			return upstream, err
+		}
+	}
+	if upstream, err = normalizeUpstream(upstream, others); err != nil {
+		return upstream, err
+	}
+	if err = validateUpstream(upstream); err != nil {
+		return upstream, err
+	}
+	if err = validateUpstreamUniqueness(upstream, others); err != nil {
+		return upstream, err
+	}
+	if upstream.ServerPrivateKey == "" {
+		key, keyErr := wgtypes.GeneratePrivateKey()
+		if keyErr != nil {
+			return upstream, keyErr
+		}
+		upstream.ServerPrivateKey = key.String()
+	}
+	return upstream, nil
+}
+
+// normalizeUpstream makes a delegation configuration self-consistent so that a
 // single-/64 upstream needs no manual per-tunnel work.
 //
 // A provider that hands this host exactly one /64 leaves no room to split off
@@ -130,16 +336,28 @@ const defaultTransportAddress = "fd00:6b72:6f6b::1/64"
 // whole prefix is therefore delegated as one allocation, the WireGuard
 // transport is numbered from a ULA instead, and no part of the prefix is
 // reserved for the server.
-func normalizeSettings(v Settings) (Settings, error) {
-	upstream, err := netip.ParsePrefix(v.UpstreamV6)
+func normalizeUpstream(v Upstream, others []Upstream) (Upstream, error) {
+	if v.MTU == 0 {
+		v.MTU = 1420
+	}
+	if v.Keepalive == 0 {
+		v.Keepalive = 25
+	}
+	if v.EndpointPort == 0 {
+		v.EndpointPort = 51820
+	}
+	if !validTunnelV4Mode(v.V4Mode) {
+		return v, errors.New("invalid IPv4 egress mode for this upstream")
+	}
+	upstream, err := netip.ParsePrefix(v.V6CIDR)
 	if err != nil || !upstream.Addr().Is6() {
 		// Leave validation to report the real problem.
 		return v, nil
 	}
 	upstream = upstream.Masked()
-	v.UpstreamV6 = upstream.String()
-	if !validUpstreamMode(v.UpstreamMode) {
-		v.UpstreamMode = UpstreamRouted
+	v.V6CIDR = upstream.String()
+	if !validUpstreamMode(v.Mode) {
+		v.Mode = UpstreamRouted
 	}
 	// A prefix no larger than a single /64 cannot be subdivided for SLAAC, so
 	// the entire prefix becomes the one allocation size on offer.
@@ -150,12 +368,12 @@ func normalizeSettings(v Settings) (Settings, error) {
 		v.MaxPrefix = min(max(v.MaxPrefix, v.MinPrefix), 128)
 		v.DefaultPrefix = min(max(v.DefaultPrefix, v.MinPrefix), v.MaxPrefix)
 	}
-	if v.UpstreamMode == UpstreamOnLink && v.TransportAddress == "" {
+	if v.Mode == UpstreamOnLink && v.TransportAddress == "" {
 		// The prefix is handed downstream in full, so the tunnel has to be
 		// numbered from somewhere else. A server address inside the prefix is
 		// rejected by validation rather than cleared here: silently dropping it
 		// would change an existing deployment's addressing without saying so.
-		v.TransportAddress = defaultTransportAddress
+		v.TransportAddress = defaultTransportAddress(othersExcept(others, v.ID))
 	}
 	if v.TransportAddress != "" {
 		transport, transportErr := netip.ParsePrefix(v.TransportAddress)
@@ -168,50 +386,19 @@ func normalizeSettings(v Settings) (Settings, error) {
 	return v, nil
 }
 
-func (a *App) ResetGeneralSettings(admin string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	cfg, err := a.store.Settings()
-	if err != nil {
-		return err
+func validateUpstream(v Upstream) error {
+	if v.Name == "" {
+		return errors.New("upstream name is required")
 	}
-	upstream, err := netip.ParsePrefix(cfg.UpstreamV6)
-	if err != nil {
-		return err
+	if utf8.RuneCountInString(v.Name) > 64 {
+		return errors.New("upstream name must be at most 64 characters")
 	}
-	minPrefix := max(upstream.Bits(), 48)
-	maxPrefix := max(minPrefix, 64)
-	defaultPrefix := min(max(56, minPrefix), maxPrefix)
-	if upstream.Bits() >= 64 {
-		// A single-/64 upstream has exactly one allocation size; normalization
-		// enforces this too, but computing it here keeps the audited values
-		// honest.
-		minPrefix, maxPrefix, defaultPrefix = upstream.Bits(), upstream.Bits(), upstream.Bits()
+	for _, character := range v.Name {
+		if unicode.IsControl(character) {
+			return errors.New("upstream name cannot contain control characters")
+		}
 	}
-	cfg.V4NAT = false
-	cfg.V4Warp = false
-	cfg.V4Pool = "10.99.0.0/16"
-	cfg.DefaultDNS = "2606:4700:4700::1111"
-	cfg.EndpointPort = 51820
-	cfg.MTU = 1420
-	cfg.Keepalive = 25
-	cfg.MinPrefix = minPrefix
-	cfg.MaxPrefix = maxPrefix
-	cfg.DefaultPrefix = defaultPrefix
-	cfg.InterTunnelPolicy = InterTunnelIsolated
-	// Reset deliberately preserves the delegation mode and transport address:
-	// they describe how the provider hands over the prefix, not a preference.
-	if cfg, err = normalizeSettings(cfg); err != nil {
-		return err
-	}
-	if err = a.store.SaveSettings(cfg); err != nil {
-		return err
-	}
-	_ = a.store.AddAudit(admin, "settings-reset", "general defaults restored")
-	return a.reconcileLocked(context.Background())
-}
-func validateSettings(v Settings) error {
-	p, e := netip.ParsePrefix(v.UpstreamV6)
+	p, e := netip.ParsePrefix(v.V6CIDR)
 	if e != nil || !p.Addr().Is6() {
 		return errors.New("upstream IPv6 must be an IPv6 CIDR")
 	}
@@ -241,11 +428,20 @@ func validateSettings(v Settings) error {
 	if v.EndpointHost == "" {
 		return errors.New("endpoint hostname or address is required")
 	}
-	if v.UpstreamInterface == "" {
-		return errors.New("upstream interface is required")
+	if v.EgressInterface == "" {
+		return errors.New("upstream egress interface is required")
+	}
+	if v.InterfaceName == "" {
+		return errors.New("WireGuard interface name is required")
 	}
 	if v.InterfaceName == warpInterfaceName {
-		return errors.New("primary WireGuard interface name is reserved for Cloudflare WARP")
+		return errors.New("WireGuard interface name is reserved for Cloudflare WARP")
+	}
+	if len(v.InterfaceName) > 15 {
+		return errors.New("WireGuard interface name must be at most 15 characters")
+	}
+	if v.InterfaceName == v.EgressInterface {
+		return errors.New("the WireGuard interface cannot be the upstream egress interface")
 	}
 	if v.EndpointPort < 1 || v.EndpointPort > 65535 {
 		return errors.New("invalid endpoint port")
@@ -256,17 +452,81 @@ func validateSettings(v Settings) error {
 			return errors.New("server address must be a CIDR within the upstream prefix")
 		}
 	}
-	if v.V4NAT && v.V4Warp {
-		return errors.New("native IPv4 NAT and Cloudflare WARP IPv4 egress cannot be enabled together")
+	if v.MTU < 1280 || v.MTU > 9000 {
+		return errors.New("MTU must be between 1280 and 9000")
 	}
-	if v.V4NAT || v.V4Warp {
-		q, e := netip.ParsePrefix(v.V4Pool)
-		if e != nil || !q.Addr().Is4() {
-			return errors.New("v4 pool must be an IPv4 CIDR")
+	if v.Keepalive < 0 || v.Keepalive > 3600 {
+		return errors.New("keepalive must be between 0 and 3600 seconds")
+	}
+	return nil
+}
+
+// validateUpstreamUniqueness rejects a connection that would collide with an
+// existing one. Upstreams are independent by design, so overlap in delegated
+// space, WireGuard interface, or listening endpoint is always a configuration
+// error rather than something to resolve silently.
+func validateUpstreamUniqueness(candidate Upstream, existing []Upstream) error {
+	prefix, ok := delegatedPrefix(candidate)
+	if !ok {
+		return errors.New("upstream IPv6 must be an IPv6 CIDR")
+	}
+	transport, hasTransport := transportPrefix(candidate)
+	for _, other := range existing {
+		if other.ID == candidate.ID {
+			continue
+		}
+		if strings.EqualFold(other.Name, candidate.Name) {
+			return errors.New("another upstream already uses that name")
+		}
+		if other.InterfaceName == candidate.InterfaceName {
+			return errors.New("another upstream already uses that WireGuard interface name")
+		}
+		// Egressing through another upstream's tunnel device would install a
+		// forwarding pair between two managed WireGuard interfaces, which is
+		// exactly what the inter-tunnel policy governs. That would let every
+		// client of one upstream reach every client of the other while the
+		// policy still reads as isolated, so it is refused outright.
+		if other.InterfaceName == candidate.EgressInterface {
+			return fmt.Errorf("egress interface %s belongs to upstream %q; chain upstreams through a separate interface instead", candidate.EgressInterface, other.Name)
+		}
+		if other.EgressInterface == candidate.InterfaceName {
+			return fmt.Errorf("WireGuard interface %s is the egress interface of upstream %q", candidate.InterfaceName, other.Name)
+		}
+		if otherPrefix, otherOK := delegatedPrefix(other); otherOK && overlaps(prefix, otherPrefix) {
+			return fmt.Errorf("delegated prefix %s overlaps upstream %q (%s)", prefix, other.Name, otherPrefix)
+		}
+		if otherTransport, otherOK := transportPrefix(other); hasTransport && otherOK && overlaps(transport.Masked(), otherTransport.Masked()) {
+			return fmt.Errorf("WireGuard transport range %s overlaps upstream %q (%s)", transport, other.Name, otherTransport)
+		}
+		// Two interfaces cannot bind the same UDP port, and clients reach an
+		// upstream by endpoint, so a shared host and port is ambiguous too.
+		if other.EndpointPort == candidate.EndpointPort && strings.EqualFold(other.EndpointHost, candidate.EndpointHost) {
+			return fmt.Errorf("upstream %q already listens on %s", other.Name, net.JoinHostPort(candidate.EndpointHost, strconv.Itoa(candidate.EndpointPort)))
 		}
 	}
-	if !validInterTunnelPolicy(v.InterTunnelPolicy) {
-		return errors.New("invalid inter-tunnel routing policy")
+	return nil
+}
+
+// validateUpstreamAgainstTunnels refuses an edit that would orphan an existing
+// allocation, so a running deployment can never be renumbered by accident.
+func validateUpstreamAgainstTunnels(upstream Upstream, tunnels []Tunnel) error {
+	prefix, ok := delegatedPrefix(upstream)
+	if !ok {
+		return errors.New("upstream IPv6 must be an IPv6 CIDR")
+	}
+	reserved, hasReservation := serverReservation(upstream)
+	for _, tunnel := range tunnels {
+		allocation, err := netip.ParsePrefix(tunnel.V6CIDR)
+		if err != nil {
+			continue
+		}
+		allocation = allocation.Masked()
+		if !prefix.Contains(allocation.Addr()) || allocation.Bits() < prefix.Bits() {
+			return fmt.Errorf("tunnel %q is allocated %s, which is outside the new delegated prefix %s", tunnel.Label, allocation, prefix)
+		}
+		if hasReservation && overlaps(reserved, allocation) {
+			return fmt.Errorf("the server address reserves %s, which tunnel %q already holds", reserved, tunnel.Label)
+		}
 	}
 	return nil
 }
@@ -308,6 +568,7 @@ func normalizeRoutingGroups(groups []string) ([]string, error) {
 }
 
 type CreateTunnelInput struct {
+	UpstreamID            int64
 	Label, PublicKey, DNS string
 	V4Mode                string
 	RoutingGroups         []string
@@ -323,8 +584,12 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	if e = validateSettings(cfg); e != nil {
+	upstream, e := a.resolveUpstream(in.UpstreamID)
+	if e != nil {
 		return Tunnel{}, e
+	}
+	if e = validateUpstream(upstream); e != nil {
+		return Tunnel{}, fmt.Errorf("upstream %q is not usable: %w", upstream.Name, e)
 	}
 	if strings.TrimSpace(in.Label) == "" {
 		return Tunnel{}, errors.New("label is required")
@@ -342,7 +607,8 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	if e != nil {
 		return Tunnel{}, e
 	}
-	if in.V4Mode == V4ModeWarp {
+	t := Tunnel{UpstreamID: upstream.ID, Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), RoutingGroups: in.RoutingGroups, Enabled: true}
+	if tunnelV4Mode(cfg, upstream, t) == V4ModeWarp {
 		account, accountErr := a.store.WarpAccount()
 		if accountErr != nil {
 			return Tunnel{}, accountErr
@@ -352,25 +618,28 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 		}
 	}
 	if in.Prefix == 0 {
-		in.Prefix = cfg.DefaultPrefix
+		in.Prefix = upstream.DefaultPrefix
 	}
-	if in.Prefix < cfg.MinPrefix || in.Prefix > cfg.MaxPrefix {
-		return Tunnel{}, errors.New("requested prefix is outside configured limits")
+	if in.Prefix < upstream.MinPrefix || in.Prefix > upstream.MaxPrefix {
+		return Tunnel{}, errors.New("requested prefix is outside the limits configured for this upstream")
 	}
-	used, e := a.store.UsedPrefixes()
+	used, e := a.store.UsedPrefixes(upstream.ID)
 	if e != nil {
 		return Tunnel{}, e
 	}
-	if reserved, ok := serverReservation(cfg); ok {
+	if reserved, ok := serverReservation(upstream); ok {
 		used = append(used, reserved)
 	}
-	pool := netip.MustParsePrefix(cfg.UpstreamV6)
+	pool, ok := delegatedPrefix(upstream)
+	if !ok {
+		return Tunnel{}, errors.New("upstream IPv6 must be an IPv6 CIDR")
+	}
 	alloc, e := Allocate(pool, used, in.Prefix)
 	if e != nil {
 		return Tunnel{}, e
 	}
-	t := Tunnel{Label: strings.TrimSpace(in.Label), PublicKey: strings.TrimSpace(in.PublicKey), V6CIDR: alloc.String(), DNSOverride: strings.TrimSpace(in.DNS), V4Mode: in.V4Mode, QuotaGiB: in.QuotaGiB, QuotaPeriod: quotaMonth(time.Now()), RoutingGroups: in.RoutingGroups, Enabled: true}
-	t.V4Enabled = tunnelV4Mode(cfg, t) != V4ModeOff
+	t.V6CIDR = alloc.String()
+	t.V4Enabled = tunnelV4Mode(cfg, upstream, t) != V4ModeOff
 	if in.GenerateKeys {
 		priv, e := wgtypes.GeneratePrivateKey()
 		if e != nil {
@@ -387,7 +656,11 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	}
 	t.PresharedKey = psk.String()
 	if t.V4Enabled {
-		t.V4Address, e = a.store.NextV4(netip.MustParsePrefix(cfg.V4Pool))
+		pool, poolErr := netip.ParsePrefix(cfg.V4Pool)
+		if poolErr != nil {
+			return t, errors.New("v4 pool must be an IPv4 CIDR")
+		}
+		t.V4Address, e = a.store.NextV4(pool)
 		if e != nil {
 			return t, e
 		}
@@ -400,25 +673,66 @@ func (a *App) CreateTunnel(in CreateTunnelInput, admin string) (Tunnel, error) {
 	}
 	return a.store.Tunnel(t.ID)
 }
+
+// resolveUpstream returns the requested upstream, or the only configured one
+// when no choice was made. Deployments with a single provider connection
+// therefore need no upstream selection at all.
+func (a *App) resolveUpstream(id int64) (Upstream, error) {
+	if id > 0 {
+		upstream, err := a.store.Upstream(id)
+		if err != nil {
+			return Upstream{}, errors.New("the selected upstream does not exist")
+		}
+		return upstream, nil
+	}
+	upstreams, err := a.store.Upstreams()
+	if err != nil {
+		return Upstream{}, err
+	}
+	switch len(upstreams) {
+	case 0:
+		return Upstream{}, errors.New("configure an upstream before creating tunnels")
+	case 1:
+		return upstreams[0], nil
+	default:
+		return Upstream{}, errors.New("select which upstream this tunnel is allocated from")
+	}
+}
+
+// TunnelUpstream returns the connection a tunnel was allocated from.
+func (a *App) TunnelUpstream(t Tunnel) (Upstream, error) {
+	return a.store.Upstream(t.UpstreamID)
+}
+
 func (a *App) SetTunnelV4Mode(id int64, mode, admin string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !validTunnelV4Mode(mode) {
 		return errors.New("invalid IPv4 egress mode")
 	}
-	if _, err := a.store.Tunnel(id); err != nil {
+	tunnel, err := a.store.Tunnel(id)
+	if err != nil {
 		return err
 	}
-	if mode == V4ModeWarp {
-		account, err := a.store.WarpAccount()
-		if err != nil {
-			return err
+	cfg, err := a.store.Settings()
+	if err != nil {
+		return err
+	}
+	upstream, err := a.store.Upstream(tunnel.UpstreamID)
+	if err != nil {
+		return err
+	}
+	tunnel.V4Mode = mode
+	if tunnelV4Mode(cfg, upstream, tunnel) == V4ModeWarp {
+		account, accountErr := a.store.WarpAccount()
+		if accountErr != nil {
+			return accountErr
 		}
 		if !account.Exists() {
 			return errors.New("create a Cloudflare WARP account before selecting WARP IPv4 egress")
 		}
 	}
-	if err := a.store.SetTunnelV4Mode(id, mode, admin); err != nil {
+	if err = a.store.SetTunnelV4Mode(id, mode, admin); err != nil {
 		return err
 	}
 	return a.reconcileLocked(context.Background())
@@ -498,11 +812,13 @@ func (a *App) DeleteTunnel(id int64, admin string) error {
 	if e != nil {
 		return e
 	}
-	cfg, e := a.store.Settings()
+	upstream, e := a.store.Upstream(t.UpstreamID)
 	if e != nil {
-		return e
+		// An orphaned tunnel has no kernel state of its own to remove, because
+		// the interface went away with its upstream.
+		return a.store.DeleteTunnel(id, admin)
 	}
-	if e = a.kernel.Remove(cfg, t); e != nil {
+	if e = a.kernel.Remove(upstream, t); e != nil {
 		_ = a.store.SetStatus(id, "error", e.Error())
 		return e
 	}
@@ -530,17 +846,34 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	if e = a.store.ResetMonthlyQuotas(now); e != nil {
 		return e
 	}
-	if cfg.UpstreamV6 == "" {
+	upstreams, e := a.store.Upstreams()
+	if e != nil {
+		return e
+	}
+	if len(upstreams) == 0 {
+		// Nothing is delegated, so the kernel must hold nothing either. Applying
+		// the empty set is what tears down the rules of a deleted last upstream
+		// rather than leaving them installed with nothing to authorize.
+		warp, warpErr := a.store.WarpAccount()
+		if warpErr != nil {
+			return warpErr
+		}
+		if _, e = a.kernel.Apply(ctx, cfg, warp, nil, nil); e != nil {
+			a.health.Error = e.Error()
+			return e
+		}
+		a.health.LastReconcile, a.health.Error, a.health.Drift = now, "", nil
 		return nil
 	}
 	ts, e := a.store.Tunnels()
 	if e != nil {
 		return e
 	}
+	byUpstream := upstreamsByID(upstreams)
 	needsIPv4 := false
 	needsWarp := false
 	for _, t := range ts {
-		mode := tunnelV4Mode(cfg, t)
+		mode := tunnelV4Mode(cfg, byUpstream[t.UpstreamID], t)
 		needsIPv4 = needsIPv4 || mode != V4ModeOff
 		needsWarp = needsWarp || mode == V4ModeWarp
 	}
@@ -573,7 +906,7 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	live, e := a.kernel.Apply(ctx, cfg, warp, ts)
+	live, e := a.kernel.Apply(ctx, cfg, warp, upstreams, ts)
 	a.health.LastReconcile = now
 	if e != nil {
 		a.health.Error = e.Error()
@@ -592,18 +925,13 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 		}
 		quotaHit = quotaHit || hit
 	}
+	ts, e = a.store.Tunnels()
+	if e != nil {
+		return e
+	}
 	if quotaHit {
-		ts, e = a.store.Tunnels()
-		if e != nil {
-			return e
-		}
-		if _, e = a.kernel.Apply(ctx, cfg, warp, ts); e != nil {
+		if _, e = a.kernel.Apply(ctx, cfg, warp, upstreams, ts); e != nil {
 			a.health.Error = e.Error()
-			return e
-		}
-	} else {
-		ts, e = a.store.Tunnels()
-		if e != nil {
 			return e
 		}
 	}
@@ -612,7 +940,7 @@ func (a *App) reconcileLocked(ctx context.Context) error {
 			_ = a.store.SetStatus(t.ID, "applied", "")
 		}
 	}
-	a.health.Drift, e = a.kernel.Inspect(cfg, warp, ts)
+	a.health.Drift, e = a.kernel.Inspect(cfg, warp, upstreams, ts)
 	if e != nil {
 		a.health.Error = e.Error()
 		return e
@@ -634,7 +962,7 @@ func (a *App) RunReconciler(ctx context.Context, interval time.Duration) {
 		}
 	}
 }
-func (a *App) ClientConfig(t Tunnel, cfg Settings) string {
+func (a *App) ClientConfig(t Tunnel, up Upstream, cfg Settings) string {
 	priv := t.PrivateKey
 	if priv == "" {
 		priv = "<client-private-key>"
@@ -643,74 +971,45 @@ func (a *App) ClientConfig(t Tunnel, cfg Settings) string {
 	if dns == "" {
 		dns = cfg.DefaultDNS
 	}
-	delegated := netip.MustParsePrefix(t.V6CIDR)
+	delegated, err := netip.ParsePrefix(t.V6CIDR)
+	if err != nil {
+		return ""
+	}
 	// The whole delegated prefix is handed to the client's LAN when it is a
 	// single /64, because SLAAC needs a full /64 there. The tunnel interface is
 	// then numbered from the transport range instead, leaving the prefix free.
 	// Otherwise the tunnel keeps its historical address inside the prefix.
 	notes := ""
 	address := firstUsable(delegated).String() + "/" + fmt.Sprint(delegated.Bits())
-	if client, ok := clientTransportAddress(cfg, t); ok {
-		transport, _ := transportPrefix(cfg)
+	if client, ok := clientTransportAddress(up, t); ok {
+		transport, _ := transportPrefix(up)
 		address = client.String() + "/" + fmt.Sprint(transport.Bits())
-		notes = fmt.Sprintf("# Routed to this peer: %s\n# Put that prefix on the LAN and advertise it there (OpenWrt: RA server, DHCPv6 server, NDP disabled).\n# Do not add it to this interface: the LAN needs the whole /64 for SLAAC.\n", delegated)
+		notes = fmt.Sprintf("# Routed to this peer: %s\n# Put that prefix on the LAN and advertise it there (OpenWrt: RA server, DHCPv6 server, NDP disabled).\n# Do not add it to this interface: the LAN needs the whole /64 for SLAAC.\n", delegated.Masked())
 	}
-	if tunnelIPv4Enabled(cfg, t) {
+	if tunnelIPv4Enabled(cfg, up, t) {
 		address += ", " + t.V4Address + "/32"
 	}
 	allowed := "::/0"
-	if tunnelIPv4Enabled(cfg, t) {
+	if tunnelIPv4Enabled(cfg, up, t) {
 		allowed = "0.0.0.0/0, ::/0"
 	}
 	pub := ""
-	if k, e := wgtypes.ParseKey(cfg.ServerPrivateKey); e == nil {
+	if k, e := wgtypes.ParseKey(up.ServerPrivateKey); e == nil {
 		pub = k.PublicKey().String()
 	}
-	endpoint := net.JoinHostPort(cfg.EndpointHost, strconv.Itoa(cfg.EndpointPort))
-	return fmt.Sprintf("%s[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %d\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = %s\nPersistentKeepalive = %d\n", notes, priv, address, dns, chooseMTU(t, cfg), pub, t.PresharedKey, endpoint, allowed, cfg.Keepalive)
+	endpoint := net.JoinHostPort(up.EndpointHost, strconv.Itoa(up.EndpointPort))
+	return fmt.Sprintf("%s[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %d\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = %s\nPersistentKeepalive = %d\n", notes, priv, address, dns, chooseMTU(t, up), pub, t.PresharedKey, endpoint, allowed, up.Keepalive)
 }
 
-// clientTransportAddress derives this tunnel's address inside the WireGuard
-// transport range. It is used when the tunnel cannot take an address from its
-// own delegated prefix because that prefix goes to the client's LAN in full.
-// The value is derived from the tunnel ID so that it is stable and needs no
-// separate allocation or manual step.
-func clientTransportAddress(cfg Settings, t Tunnel) (netip.Addr, bool) {
-	transport, ok := transportPrefix(cfg)
-	if !ok || upstreamMode(cfg) != UpstreamOnLink || t.ID <= 0 {
-		return netip.Addr{}, false
-	}
-	candidate := offsetAddr(transport.Masked().Addr(), uint64(t.ID)+1)
-	// The server holds one address in this range; step past it rather than
-	// duplicating it.
-	if candidate == transport.Addr() {
-		candidate = offsetAddr(candidate, 1)
-	}
-	if !transport.Contains(candidate) {
-		return netip.Addr{}, false
-	}
-	return candidate, true
-}
-
-func offsetAddr(base netip.Addr, offset uint64) netip.Addr {
-	value := base.As16()
-	carry := offset
-	for i := 15; i >= 0 && carry > 0; i-- {
-		sum := uint64(value[i]) + carry&0xff
-		value[i] = byte(sum)
-		carry = carry>>8 + sum>>8
-	}
-	return netip.AddrFrom16(value)
-}
 func firstUsable(p netip.Prefix) netip.Addr {
 	if p.Bits() == p.Addr().BitLen() {
 		return p.Masked().Addr()
 	}
 	return p.Masked().Addr().Next()
 }
-func chooseMTU(t Tunnel, c Settings) int {
+func chooseMTU(t Tunnel, up Upstream) int {
 	if t.MTUOverride > 0 {
 		return t.MTUOverride
 	}
-	return c.MTU
+	return up.MTU
 }

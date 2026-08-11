@@ -17,14 +17,17 @@ import (
 )
 
 type fakeKernel struct {
-	applyErr error
-	applied  []Tunnel
-	traffic  map[int64][2]int64
-	applyN   int
-	closed   bool
+	applyErr          error
+	removeUpstreamErr error
+	applied           []Tunnel
+	appliedUpstream   []Upstream
+	traffic           map[int64][2]int64
+	applyN            int
+	removedUpstream   []string
+	closed            bool
 }
 
-func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, tunnels []Tunnel) ([]Tunnel, error) {
+func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, upstreams []Upstream, tunnels []Tunnel) ([]Tunnel, error) {
 	f.applyN++
 	for i := range tunnels {
 		if counters, ok := f.traffic[tunnels[i].ID]; ok {
@@ -33,15 +36,28 @@ func (f *fakeKernel) Apply(_ context.Context, _ Settings, _ WarpAccount, tunnels
 		}
 	}
 	f.applied = append([]Tunnel(nil), tunnels...)
+	f.appliedUpstream = append([]Upstream(nil), upstreams...)
 	return tunnels, f.applyErr
 }
-func (f *fakeKernel) Inspect(_ Settings, _ WarpAccount, _ []Tunnel) ([]string, error) {
+func (f *fakeKernel) Inspect(_ Settings, _ WarpAccount, _ []Upstream, _ []Tunnel) ([]string, error) {
 	return nil, nil
 }
-func (f *fakeKernel) Remove(_ Settings, _ Tunnel) error { return nil }
-func (f *fakeKernel) Close() error                      { f.closed = true; return nil }
+func (f *fakeKernel) Remove(_ Upstream, _ Tunnel) error { return nil }
+func (f *fakeKernel) RemoveUpstream(u Upstream) error {
+	if f.removeUpstreamErr != nil {
+		return f.removeUpstreamErr
+	}
+	f.removedUpstream = append(f.removedUpstream, u.InterfaceName)
+	return nil
+}
+func (f *fakeKernel) Close() error { f.closed = true; return nil }
 func (f *fakeKernel) TestWarp(_ context.Context, _ Settings, _ WarpAccount) (string, error) {
 	return "fl=1\nip=203.0.113.8\nwarp=on\n", nil
+}
+
+// testUpstream is the routed /48 that most tests allocate from.
+func testUpstream() UpstreamInput {
+	return UpstreamInput{Name: "primary", V6CIDR: "2001:db8:1200::/48", Mode: UpstreamRouted, EndpointHost: "broker.example.test", EndpointPort: 51820, InterfaceName: "wg-test", ServerAddress: "2001:db8:1200::1/64", MTU: 1420, Keepalive: 25, MinPrefix: 56, MaxPrefix: 64, DefaultPrefix: 56, EgressInterface: "eth0"}
 }
 
 func testApp(t *testing.T) (*App, *fakeKernel) {
@@ -53,11 +69,24 @@ func testApp(t *testing.T) (*App, *fakeKernel) {
 	t.Cleanup(func() { _ = a.Close() })
 	f := &fakeKernel{}
 	a.kernel = f
-	err = a.SaveSettings(Settings{UpstreamV6: "2001:db8:1200::/48", V4Pool: "10.99.0.0/16", DefaultDNS: "2606:4700:4700::1111", EndpointHost: "broker.example.test", EndpointPort: 51820, InterfaceName: "wg-test", ServerAddress: "2001:db8:1200::1/64", MTU: 1420, Keepalive: 25, MinPrefix: 56, MaxPrefix: 64, DefaultPrefix: 56, UpstreamInterface: "eth0"})
-	if err != nil {
+	if err = a.SaveSettings(Settings{V4Pool: "10.99.0.0/16", DefaultDNS: "2606:4700:4700::1111"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.CreateUpstream(testUpstream(), "admin"); err != nil {
 		t.Fatal(err)
 	}
 	return a, f
+}
+
+// mustUpstream returns the single configured upstream, which is what most tests
+// allocate from.
+func mustUpstream(t *testing.T, a *App) Upstream {
+	t.Helper()
+	upstreams, err := a.store.Upstreams()
+	if err != nil || len(upstreams) == 0 {
+		t.Fatalf("no upstream configured: %+v, %v", upstreams, err)
+	}
+	return upstreams[0]
 }
 
 func TestCreateTunnelPersistsThenApplies(t *testing.T) {
@@ -77,8 +106,11 @@ func TestCreateTunnelPersistsThenApplies(t *testing.T) {
 		t.Fatalf("unexpected default monthly quota: %+v", tunnel)
 	}
 	expectedAddress := "Address = " + firstUsable(allocation).String() + "/56"
-	if cfg := a.ClientConfig(tunnel, mustSettings(t, a)); !containsAll(cfg, expectedAddress, "Endpoint = broker.example.test:51820") {
+	if cfg := a.ClientConfig(tunnel, mustUpstream(t, a), mustSettings(t, a)); !containsAll(cfg, expectedAddress, "Endpoint = broker.example.test:51820") {
 		t.Fatalf("bad client config: %s", cfg)
+	}
+	if tunnel.UpstreamID != mustUpstream(t, a).ID {
+		t.Fatalf("tunnel was not attached to its upstream: %+v", tunnel)
 	}
 }
 
@@ -180,14 +212,15 @@ func TestMonthlyQuotaHandlesWireGuardCounterReset(t *testing.T) {
 func TestTunnelCreateAndEditFormsExposeMonthlyQuota(t *testing.T) {
 	a, _ := testApp(t)
 	managed := []RoutingGroup{{ID: 1, Name: "internal"}, {ID: 2, Name: "production"}}
+	upstream := mustUpstream(t, a)
 	newRecorder := httptest.NewRecorder()
-	a.render(newRecorder, "new", view{Title: "New tunnel", Settings: mustSettings(t, a), Prefixes: []int{56}, RoutingGroups: managed})
+	a.render(newRecorder, "new", view{Title: "New tunnel", Settings: mustSettings(t, a), Upstream: upstream, Upstreams: []upstreamView{{Upstream: upstream}}, Prefixes: []int{56}, RoutingGroups: managed})
 	if body := newRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="100"`, `name="routing_groups"`, `multiple`, "Monthly upload + download quota") {
 		t.Fatalf("new tunnel quota field is missing: %s", body)
 	}
 
 	detailRecorder := httptest.NewRecorder()
-	a.render(detailRecorder, "detail", view{Title: "Tunnel", Tunnel: Tunnel{ID: 1, V6CIDR: "2001:db8::/64", QuotaGiB: 250, QuotaPeriod: "2026-08", RoutingGroups: []string{"internal"}}, RoutingGroups: managed, EffectiveV4Mode: V4ModeOff})
+	a.render(detailRecorder, "detail", view{Title: "Tunnel", Tunnel: Tunnel{ID: 1, V6CIDR: "2001:db8::/64", QuotaGiB: 250, QuotaPeriod: "2026-08", RoutingGroups: []string{"internal"}}, Upstream: mustUpstream(t, a), RoutingGroups: managed, EffectiveV4Mode: V4ModeOff})
 	if body := detailRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="250"`, `name="routing_groups"`, `value="internal" selected`, "Monthly traffic:", "2026-08") {
 		t.Fatalf("edit tunnel quota field is missing: %s", body)
 	}
@@ -236,10 +269,10 @@ func TestApplyFailureLeavesAllocationInError(t *testing.T) {
 
 func TestClientConfigFormatsIPv6EndpointAndSingleAddress(t *testing.T) {
 	a, _ := testApp(t)
-	cfg := mustSettings(t, a)
-	cfg.EndpointHost = "2001:db8::10"
+	upstream := mustUpstream(t, a)
+	upstream.EndpointHost = "2001:db8::10"
 	tunnel := Tunnel{V6CIDR: "2001:db8:1200::9/128", PresharedKey: "test"}
-	generated := a.ClientConfig(tunnel, cfg)
+	generated := a.ClientConfig(tunnel, upstream, mustSettings(t, a))
 	if !containsAll(generated, "Address = 2001:db8:1200::9/128", "Endpoint = [2001:db8::10]:51820") {
 		t.Fatalf("bad client config: %s", generated)
 	}
@@ -248,16 +281,17 @@ func TestClientConfigFormatsIPv6EndpointAndSingleAddress(t *testing.T) {
 func TestClientConfigGlobalNATToggleControlsIPv4(t *testing.T) {
 	a, _ := testApp(t)
 	cfg := mustSettings(t, a)
+	upstream := mustUpstream(t, a)
 	tunnel := Tunnel{V6CIDR: "2001:db8:1200:100::/56", V4Enabled: true, V4Address: "10.99.0.2"}
 
 	cfg.V4NAT = false
-	v6Only := a.ClientConfig(tunnel, cfg)
+	v6Only := a.ClientConfig(tunnel, upstream, cfg)
 	if strings.Contains(v6Only, "10.99.0.2") || strings.Contains(v6Only, "0.0.0.0/0") || !strings.Contains(v6Only, "AllowedIPs = ::/0") {
 		t.Fatalf("IPv4 leaked into config while global NAT was disabled: %s", v6Only)
 	}
 
 	cfg.V4NAT = true
-	dualStack := a.ClientConfig(tunnel, cfg)
+	dualStack := a.ClientConfig(tunnel, upstream, cfg)
 	if !containsAll(dualStack, "10.99.0.2/32", "AllowedIPs = 0.0.0.0/0, ::/0") {
 		t.Fatalf("IPv4 missing while NAT was enabled: %s", dualStack)
 	}
@@ -314,18 +348,19 @@ func TestEnablingGlobalIPv4BackfillsExistingTunnels(t *testing.T) {
 func TestTunnelIPv4ModeOverridesGlobalDefault(t *testing.T) {
 	a, _ := testApp(t)
 	cfg := mustSettings(t, a)
+	upstream := mustUpstream(t, a)
 
 	native, err := a.CreateTunnel(CreateTunnelInput{Label: "native", V4Mode: V4ModeNative, GenerateKeys: true}, "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if native.V4Mode != V4ModeNative || native.V4Address != "10.99.0.1" || !tunnelIPv4Enabled(cfg, native) {
+	if native.V4Mode != V4ModeNative || native.V4Address != "10.99.0.1" || !tunnelIPv4Enabled(cfg, upstream, native) {
 		t.Fatalf("native override was not applied: %+v", native)
 	}
 	if current := mustSettings(t, a); current.V4NAT || current.V4Warp {
 		t.Fatalf("tunnel override changed global mode: %+v", current)
 	}
-	if generated := a.ClientConfig(native, cfg); !containsAll(generated, "10.99.0.1/32", "AllowedIPs = 0.0.0.0/0, ::/0") {
+	if generated := a.ClientConfig(native, upstream, cfg); !containsAll(generated, "10.99.0.1/32", "AllowedIPs = 0.0.0.0/0, ::/0") {
 		t.Fatalf("override missing from client config: %s", generated)
 	}
 
@@ -337,8 +372,60 @@ func TestTunnelIPv4ModeOverridesGlobalDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if disabled.V4Address != "" || tunnelIPv4Enabled(cfg, disabled) {
+	if disabled.V4Address != "" || tunnelIPv4Enabled(cfg, upstream, disabled) {
 		t.Fatalf("disabled override inherited global native mode: %+v", disabled)
+	}
+}
+
+// The three-level default must resolve tunnel over upstream over global, so an
+// upstream without IPv4 connectivity can opt all of its tunnels out.
+func TestUpstreamIPv4ModeOverridesGlobalAndYieldsToTunnel(t *testing.T) {
+	a, _ := testApp(t)
+	cfg := mustSettings(t, a)
+	cfg.V4NAT = true
+	if err := a.SaveSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg = mustSettings(t, a)
+
+	input := testUpstream()
+	input.Name = "v6-only"
+	input.V6CIDR = "2001:db8:1300::/48"
+	input.ServerAddress = "2001:db8:1300::1/64"
+	input.InterfaceName = "wg-v6only"
+	input.EndpointPort = 51821
+	input.EgressInterface = "ppp0"
+	input.V4Mode = V4ModeOff
+	v6Only, err := a.CreateUpstream(input, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upstreamV4Mode(cfg, v6Only) != V4ModeOff {
+		t.Fatalf("upstream override did not beat the global default: %+v", v6Only)
+	}
+
+	inherited, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: v6Only.ID, Label: "inherits-off", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherited.V4Address != "" || tunnelIPv4Enabled(cfg, v6Only, inherited) {
+		t.Fatalf("tunnel inherited IPv4 from the global default instead of its upstream: %+v", inherited)
+	}
+	// A tunnel may still override its upstream in the other direction.
+	overridden, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: v6Only.ID, Label: "opts-in", V4Mode: V4ModeNative, GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overridden.V4Address == "" || !tunnelIPv4Enabled(cfg, v6Only, overridden) {
+		t.Fatalf("tunnel override did not beat its upstream: %+v", overridden)
+	}
+	// Tunnels on the original upstream keep following the global default.
+	primary, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: mustUpstream(t, a).ID, Label: "global", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primary.V4Address == "" {
+		t.Fatalf("an unrelated upstream lost its global IPv4 default: %+v", primary)
 	}
 }
 
@@ -431,7 +518,7 @@ func TestRoutingMigrationAddsSafeDefaults(t *testing.T) {
 	if _, err = store.db.Exec(`ALTER TABLE settings DROP COLUMN inter_tunnel_policy`); err != nil {
 		t.Fatal(err)
 	}
-	legacy := Tunnel{Label: "legacy", PublicKey: "legacy-key", PresharedKey: "legacy-psk", V6CIDR: "2001:db8::/64", QuotaGiB: 100, QuotaPeriod: "2026-08", Enabled: true}
+	legacy := Tunnel{UpstreamID: 1, Label: "legacy", PublicKey: "legacy-key", PresharedKey: "legacy-psk", V6CIDR: "2001:db8::/64", QuotaGiB: 100, QuotaPeriod: "2026-08", Enabled: true}
 	if err = store.InsertTunnel(&legacy, "admin"); err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +581,7 @@ func TestExistingTunnelIPv4ModeCanBeEdited(t *testing.T) {
 		t.Fatal(err)
 	}
 	tunnel, err = a.store.Tunnel(tunnel.ID)
-	if err != nil || tunnel.V4Mode != V4ModeOff || tunnelIPv4Enabled(mustSettings(t, a), tunnel) {
+	if err != nil || tunnel.V4Mode != V4ModeOff || tunnelIPv4Enabled(mustSettings(t, a), mustUpstream(t, a), tunnel) {
 		t.Fatalf("disabled mode edit was not applied: %+v, %v", tunnel, err)
 	}
 	if err = a.SetTunnelV4Mode(tunnel.ID, "invalid", "admin"); err == nil {
@@ -504,14 +591,12 @@ func TestExistingTunnelIPv4ModeCanBeEdited(t *testing.T) {
 
 func TestResetGeneralSettingsPreservesDeploymentIdentity(t *testing.T) {
 	a, _ := testApp(t)
+	before := mustUpstream(t, a)
 	cfg := mustSettings(t, a)
 	cfg.V4NAT = true
 	cfg.V4Pool = "10.88.0.0/16"
 	cfg.DefaultDNS = "2001:db8::53"
-	cfg.EndpointPort = 12345
-	cfg.MTU = 1280
-	cfg.Keepalive = 9
-	cfg.MinPrefix, cfg.MaxPrefix, cfg.DefaultPrefix = 60, 72, 64
+	cfg.InterTunnelPolicy = InterTunnelAny
 	if err := a.SaveSettings(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -519,11 +604,380 @@ func TestResetGeneralSettingsPreservesDeploymentIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	reset := mustSettings(t, a)
-	if reset.V4NAT || reset.V4Warp || reset.V4Pool != "10.99.0.0/16" || reset.DefaultDNS != "2606:4700:4700::1111" || reset.EndpointPort != 51820 || reset.MTU != 1420 || reset.Keepalive != 25 || reset.MinPrefix != 48 || reset.DefaultPrefix != 56 || reset.MaxPrefix != 64 {
+	if reset.V4NAT || reset.V4Warp || reset.V4Pool != "10.99.0.0/16" || reset.DefaultDNS != "2606:4700:4700::1111" || reset.InterTunnelPolicy != InterTunnelIsolated {
 		t.Fatalf("general defaults not restored: %+v", reset)
 	}
-	if reset.UpstreamV6 != cfg.UpstreamV6 || reset.EndpointHost != cfg.EndpointHost || reset.ServerAddress != cfg.ServerAddress || reset.ServerPrivateKey != cfg.ServerPrivateKey || reset.UpstreamInterface != cfg.UpstreamInterface || reset.InterfaceName != cfg.InterfaceName {
-		t.Fatalf("deployment identity changed: before=%+v after=%+v", cfg, reset)
+	// Upstreams describe the deployment, not a preference, so a reset of the
+	// global settings must leave every provider connection untouched.
+	after := mustUpstream(t, a)
+	if after != before {
+		t.Fatalf("upstream configuration changed: before=%+v after=%+v", before, after)
+	}
+}
+
+// A tunnel must be allocated from the upstream that was asked for, and prefixes
+// from two upstreams must be able to coexist without colliding.
+func TestTunnelsAreAllocatedFromTheSelectedUpstream(t *testing.T) {
+	a, kernel := testApp(t)
+	primary := mustUpstream(t, a)
+
+	second := testUpstream()
+	second.Name = "secondary"
+	second.V6CIDR = "2001:db8:9900::/48"
+	second.ServerAddress = "2001:db8:9900::1/64"
+	second.InterfaceName = "wg-second"
+	second.EndpointPort = 51821
+	second.EgressInterface = "ppp0"
+	secondary, err := a.CreateUpstream(second, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: primary.ID, Label: "on-primary", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: secondary.ID, Label: "on-secondary", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !netip.MustParsePrefix(primary.V6CIDR).Contains(netip.MustParsePrefix(first.V6CIDR).Addr()) {
+		t.Fatalf("tunnel was not allocated from its upstream: %s not in %s", first.V6CIDR, primary.V6CIDR)
+	}
+	if !netip.MustParsePrefix(secondary.V6CIDR).Contains(netip.MustParsePrefix(other.V6CIDR).Addr()) {
+		t.Fatalf("tunnel was not allocated from its upstream: %s not in %s", other.V6CIDR, secondary.V6CIDR)
+	}
+	if first.UpstreamID != primary.ID || other.UpstreamID != secondary.ID {
+		t.Fatalf("upstream attachment is wrong: %+v %+v", first, other)
+	}
+	// Both connections must reach the kernel together, since each owns its own
+	// interface and peer table.
+	if len(kernel.appliedUpstream) != 2 {
+		t.Fatalf("kernel did not receive both upstreams: %+v", kernel.appliedUpstream)
+	}
+	// Free space is per upstream, so filling one must not affect the other.
+	usedPrimary, err := a.store.UsedPrefixes(primary.ID)
+	if err != nil || len(usedPrimary) != 1 || usedPrimary[0].String() != first.V6CIDR {
+		t.Fatalf("per-upstream allocations leaked: %+v, %v", usedPrimary, err)
+	}
+}
+
+// With more than one upstream the choice is required, because allocating from
+// an arbitrary provider would hand out the wrong address space.
+func TestTunnelCreationRequiresAnUpstreamChoiceWhenSeveralExist(t *testing.T) {
+	a, _ := testApp(t)
+	if _, err := a.CreateTunnel(CreateTunnelInput{Label: "implicit", GenerateKeys: true}, "admin"); err != nil {
+		t.Fatalf("a single-upstream deployment should not require a choice: %v", err)
+	}
+	second := testUpstream()
+	second.Name = "secondary"
+	second.V6CIDR = "2001:db8:9900::/48"
+	second.ServerAddress = "2001:db8:9900::1/64"
+	second.InterfaceName = "wg-second"
+	second.EndpointPort = 51821
+	if _, err := a.CreateUpstream(second, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateTunnel(CreateTunnelInput{Label: "ambiguous", GenerateKeys: true}, "admin"); err == nil {
+		t.Fatal("an ambiguous allocation was accepted")
+	}
+	if _, err := a.CreateTunnel(CreateTunnelInput{UpstreamID: 9999, Label: "missing", GenerateKeys: true}, "admin"); err == nil {
+		t.Fatal("a tunnel was allocated from a nonexistent upstream")
+	}
+}
+
+// Two connections that would fight in the kernel or hand out overlapping space
+// must be refused at configuration time rather than diagnosed as drift later.
+func TestUpstreamsMustNotCollide(t *testing.T) {
+	a, _ := testApp(t)
+	base := testUpstream()
+
+	duplicateName := base
+	duplicateName.V6CIDR = "2001:db8:9900::/48"
+	duplicateName.ServerAddress = "2001:db8:9900::1/64"
+	duplicateName.InterfaceName = "wg-other"
+	duplicateName.EndpointPort = 51821
+	if _, err := a.CreateUpstream(duplicateName, "admin"); err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("a duplicate upstream name was accepted: %v", err)
+	}
+
+	duplicateInterface := duplicateName
+	duplicateInterface.Name = "second"
+	duplicateInterface.InterfaceName = base.InterfaceName
+	if _, err := a.CreateUpstream(duplicateInterface, "admin"); err == nil || !strings.Contains(err.Error(), "interface") {
+		t.Fatalf("a duplicate WireGuard interface was accepted: %v", err)
+	}
+
+	overlapping := duplicateName
+	overlapping.Name = "overlapping"
+	overlapping.V6CIDR = "2001:db8:1200:8000::/52"
+	overlapping.ServerAddress = ""
+	if _, err := a.CreateUpstream(overlapping, "admin"); err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("an overlapping delegated prefix was accepted: %v", err)
+	}
+
+	sameEndpoint := duplicateName
+	sameEndpoint.Name = "same-endpoint"
+	sameEndpoint.EndpointPort = base.EndpointPort
+	if _, err := a.CreateUpstream(sameEndpoint, "admin"); err == nil || !strings.Contains(err.Error(), "listens on") {
+		t.Fatalf("a duplicate listening endpoint was accepted: %v", err)
+	}
+
+	reserved := duplicateName
+	reserved.Name = "reserved"
+	reserved.InterfaceName = warpInterfaceName
+	if _, err := a.CreateUpstream(reserved, "admin"); err == nil {
+		t.Fatal("the WARP interface name was accepted as an upstream interface")
+	}
+}
+
+// Egressing one upstream through another's tunnel device would install a
+// forwarding pair between two managed WireGuard interfaces, letting every
+// client of one reach every client of the other while the routing policy still
+// reads as isolated.
+func TestUpstreamCannotEgressThroughAnotherUpstreamsTunnel(t *testing.T) {
+	a, _ := testApp(t)
+	primary := mustUpstream(t, a)
+
+	chained := testUpstream()
+	chained.Name = "chained"
+	chained.V6CIDR = "2001:db8:9900::/48"
+	chained.ServerAddress = "2001:db8:9900::1/64"
+	chained.InterfaceName = "wg-chained"
+	chained.EndpointPort = 51821
+	chained.EgressInterface = primary.InterfaceName
+	if _, err := a.CreateUpstream(chained, "admin"); err == nil || !strings.Contains(err.Error(), "belongs to upstream") {
+		t.Fatalf("an upstream egressing through another's tunnel was accepted: %v", err)
+	}
+
+	// The reverse arrangement is the same problem seen from the other side.
+	reversed := chained
+	reversed.EgressInterface = "ppp0"
+	reversed.InterfaceName = primary.EgressInterface
+	if _, err := a.CreateUpstream(reversed, "admin"); err == nil {
+		t.Fatalf("a WireGuard interface that is another upstream's egress was accepted: %v", err)
+	}
+
+	// Chaining through a separate interface remains allowed: an upstream may
+	// legitimately ride over a WireGuard tunnel this application does not own.
+	external := chained
+	external.EgressInterface = "wg-provider"
+	if _, err := a.CreateUpstream(external, "admin"); err != nil {
+		t.Fatalf("an upstream over an unmanaged tunnel interface was refused: %v", err)
+	}
+}
+
+// Deleting an upstream must remove its kernel state before its row, because the
+// row is what a later reconciliation uses to find that interface again.
+func TestUpstreamDeletionKeepsTheRowWhenTeardownFails(t *testing.T) {
+	a, kernel := testApp(t)
+	upstream := mustUpstream(t, a)
+	kernel.removeUpstreamErr = errors.New("synthetic netlink failure")
+
+	if err := a.DeleteUpstream(upstream.ID, "admin"); err == nil {
+		t.Fatal("a failed teardown was reported as a successful deletion")
+	}
+	remaining, err := a.store.Upstreams()
+	if err != nil || len(remaining) != 1 {
+		t.Fatalf("the upstream row was dropped despite a failed teardown, leaking its interface: %+v, %v", remaining, err)
+	}
+	// Once the kernel cooperates, the deletion completes normally.
+	kernel.removeUpstreamErr = nil
+	if err = a.DeleteUpstream(upstream.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if remaining, err = a.store.Upstreams(); err != nil || len(remaining) != 0 {
+		t.Fatalf("retrying the deletion did not remove the upstream: %+v, %v", remaining, err)
+	}
+}
+
+// Deleting an upstream must not silently strand the tunnels allocated from it,
+// and must remove its kernel interface once it is genuinely unused.
+func TestUpstreamDeletionProtectsExistingTunnels(t *testing.T) {
+	a, kernel := testApp(t)
+	upstream := mustUpstream(t, a)
+	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "held", GenerateKeys: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.DeleteUpstream(upstream.ID, "admin"); err == nil {
+		t.Fatal("an upstream with tunnels was deleted")
+	}
+	if err = a.DeleteTunnel(tunnel.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.DeleteUpstream(upstream.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if len(kernel.removedUpstream) != 1 || kernel.removedUpstream[0] != upstream.InterfaceName {
+		t.Fatalf("the upstream interface was not torn down: %+v", kernel.removedUpstream)
+	}
+	remaining, err := a.store.Upstreams()
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("upstream was not deleted: %+v, %v", remaining, err)
+	}
+	// Removing the last upstream must still reach the kernel with an empty
+	// desired state, or its forwarding and NAT rules would stay installed with
+	// nothing left to authorize them.
+	if len(kernel.appliedUpstream) != 0 || len(kernel.applied) != 0 {
+		t.Fatalf("the empty desired state was not applied: upstreams=%+v tunnels=%+v", kernel.appliedUpstream, kernel.applied)
+	}
+}
+
+// Editing an upstream must never orphan an allocation that clients already use.
+func TestUpstreamEditCannotOrphanAllocations(t *testing.T) {
+	a, _ := testApp(t)
+	upstream := mustUpstream(t, a)
+	if _, err := a.CreateTunnel(CreateTunnelInput{Label: "existing", GenerateKeys: true}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	moved := testUpstream()
+	moved.ID = upstream.ID
+	moved.V6CIDR = "2001:db8:4400::/48"
+	moved.ServerAddress = "2001:db8:4400::1/64"
+	if _, err := a.UpdateUpstream(moved, "admin"); err == nil || !strings.Contains(err.Error(), "outside the new delegated prefix") {
+		t.Fatalf("renumbering an upstream under a live tunnel was accepted: %v", err)
+	}
+	// A harmless edit on the same prefix must still be applied.
+	renamed := testUpstream()
+	renamed.ID = upstream.ID
+	renamed.Name = "renamed"
+	if _, err := a.UpdateUpstream(renamed, "admin"); err != nil {
+		t.Fatalf("a safe upstream edit was refused: %v", err)
+	}
+	if got := mustUpstream(t, a); got.Name != "renamed" || got.ServerPrivateKey != upstream.ServerPrivateKey {
+		t.Fatalf("edit did not preserve upstream identity: %+v", got)
+	}
+}
+
+// TestLegacySingleUpstreamIsMigratedIntoAnUpstreamRow recreates a database
+// written before multiple upstreams existed and checks that an upgrade keeps the
+// running deployment exactly as it was: same prefix, same keys, same interface,
+// with every existing tunnel still attached to it.
+func TestLegacySingleUpstreamIsMigratedIntoAnUpstreamRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild the pre-upstream settings schema, including the delegation
+	// columns, and drop the new table entirely.
+	for _, statement := range legacySettingsSchema(true) {
+		if _, err = store.db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if _, err = store.db.Exec(`INSERT INTO tunnels(upstream_id,label,public_key,allocated_v6_cidr,quota_gib,quota_period,enabled,created_at,updated_at) VALUES(0,'legacy','legacy-key','2001:db8:1200:100::/56',100,'2026-08',1,'2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	upstreams, err := store.Upstreams()
+	if err != nil || len(upstreams) != 1 {
+		t.Fatalf("legacy upstream was not migrated: %+v, %v", upstreams, err)
+	}
+	migrated := upstreams[0]
+	if migrated.V6CIDR != "2001:db8:1200::/48" || migrated.ServerAddress != "2001:db8:1200::1/64" || migrated.ServerPrivateKey != "legacy-private-key" {
+		t.Fatalf("migration changed the delegated addressing or key: %+v", migrated)
+	}
+	if migrated.InterfaceName != "wg-legacy" || migrated.EgressInterface != "ppp0" || migrated.EndpointHost != "legacy.example.test" || migrated.EndpointPort != 51999 {
+		t.Fatalf("migration changed the deployment's interfaces or endpoint: %+v", migrated)
+	}
+	if migrated.Mode != UpstreamRouted || migrated.MinPrefix != 48 || migrated.MaxPrefix != 64 || migrated.DefaultPrefix != 56 {
+		t.Fatalf("migration changed delegation behavior: %+v", migrated)
+	}
+	if migrated.TunnelCount != 1 {
+		t.Fatalf("existing tunnels were not attached to the migrated upstream: %+v", migrated)
+	}
+	tunnels, err := store.TunnelsForUpstream(migrated.ID)
+	if err != nil || len(tunnels) != 1 || tunnels[0].V6CIDR != "2001:db8:1200:100::/56" {
+		t.Fatalf("existing allocation was disturbed: %+v, %v", tunnels, err)
+	}
+	// A second open must be idempotent rather than duplicating the upstream.
+	if err = store.migrateLegacyUpstream(); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := store.Upstreams(); len(again) != 1 {
+		t.Fatalf("migration ran twice: %+v", again)
+	}
+}
+
+// legacySettingsSchema rebuilds the pre-upstream settings columns. onLink adds
+// the delegation columns, which only exist in databases written after on-link
+// support landed; a database older than that must migrate just as safely.
+func legacySettingsSchema(onLink bool) []string {
+	statements := []string{
+		`DROP TABLE upstreams`,
+		`ALTER TABLE settings ADD COLUMN upstream_v6 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE settings ADD COLUMN upstream_v4 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE settings ADD COLUMN endpoint_host TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE settings ADD COLUMN endpoint_port INTEGER NOT NULL DEFAULT 51820`,
+		`ALTER TABLE settings ADD COLUMN interface_name TEXT NOT NULL DEFAULT 'wg0'`,
+		`ALTER TABLE settings ADD COLUMN server_address TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE settings ADD COLUMN server_private_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE settings ADD COLUMN mtu INTEGER NOT NULL DEFAULT 1420`,
+		`ALTER TABLE settings ADD COLUMN keepalive INTEGER NOT NULL DEFAULT 25`,
+		`ALTER TABLE settings ADD COLUMN min_prefix INTEGER NOT NULL DEFAULT 48`,
+		`ALTER TABLE settings ADD COLUMN max_prefix INTEGER NOT NULL DEFAULT 64`,
+		`ALTER TABLE settings ADD COLUMN default_prefix INTEGER NOT NULL DEFAULT 56`,
+		`ALTER TABLE settings ADD COLUMN upstream_interface TEXT NOT NULL DEFAULT 'ppp0'`,
+	}
+	if onLink {
+		statements = append(statements,
+			`ALTER TABLE settings ADD COLUMN upstream_mode TEXT NOT NULL DEFAULT 'routed'`,
+			`ALTER TABLE settings ADD COLUMN transport_address TEXT NOT NULL DEFAULT ''`)
+	}
+	return append(statements, `UPDATE settings SET upstream_v6='2001:db8:1200::/48',server_address='2001:db8:1200::1/64',server_private_key='legacy-private-key',endpoint_host='legacy.example.test',endpoint_port=51999,interface_name='wg-legacy',upstream_interface='ppp0',min_prefix=48,max_prefix=64,default_prefix=56 WHERE id=1`)
+}
+
+// A database written before delegation modes existed has no upstream_mode or
+// transport_address column at all. Reading them unconditionally would fail and
+// silently leave the deployment with no upstream, orphaning every tunnel.
+func TestUpstreamMigrationHandlesDatabasesPredatingDelegationModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ancient.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range legacySettingsSchema(false) {
+		if _, err = store.db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if _, err = store.db.Exec(`INSERT INTO tunnels(upstream_id,label,public_key,allocated_v6_cidr,quota_gib,quota_period,enabled,created_at,updated_at) VALUES(0,'ancient','ancient-key','2001:db8:1200:700::/56',100,'2026-08',1,'2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	upstreams, err := store.Upstreams()
+	if err != nil || len(upstreams) != 1 {
+		t.Fatalf("a database predating delegation modes lost its upstream: %+v, %v", upstreams, err)
+	}
+	migrated := upstreams[0]
+	// Such a database can only have been routed, and must not acquire a
+	// transport address it never had.
+	if migrated.Mode != UpstreamRouted || migrated.TransportAddress != "" {
+		t.Fatalf("migration invented a delegation configuration: %+v", migrated)
+	}
+	if migrated.V6CIDR != "2001:db8:1200::/48" || migrated.ServerPrivateKey != "legacy-private-key" || migrated.InterfaceName != "wg-legacy" {
+		t.Fatalf("migration disturbed the deployment: %+v", migrated)
+	}
+	if migrated.TunnelCount != 1 {
+		t.Fatalf("the existing tunnel was orphaned: %+v", migrated)
 	}
 }
 

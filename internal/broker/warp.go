@@ -117,13 +117,9 @@ func (a *App) RegisterWarp(ctx context.Context, admin string) (WarpAccount, erro
 	if err != nil {
 		return account, err
 	}
-	tunnels, tunnelsErr := a.store.Tunnels()
-	if tunnelsErr != nil {
-		return account, tunnelsErr
-	}
-	warpConfigured := cfg.V4Warp
-	for _, tunnel := range tunnels {
-		warpConfigured = warpConfigured || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
+	warpConfigured, err := a.warpConfigured(cfg)
+	if err != nil {
+		return account, err
 	}
 	if warpConfigured {
 		if err = a.Reconcile(ctx); err != nil {
@@ -142,13 +138,9 @@ func (a *App) TestWarp(ctx context.Context, admin string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tunnels, err := a.store.Tunnels()
+	warpConfigured, err := a.warpConfigured(cfg)
 	if err != nil {
 		return "", err
-	}
-	warpConfigured := cfg.V4Warp
-	for _, tunnel := range tunnels {
-		warpConfigured = warpConfigured || tunnelV4Mode(cfg, tunnel) == V4ModeWarp
 	}
 	if !warpConfigured {
 		return "", errors.New("Cloudflare WARP IPv4 egress is not enabled")
@@ -169,6 +161,34 @@ func (a *App) TestWarp(ctx context.Context, admin string) (string, error) {
 	}
 	_ = a.store.AddAudit(admin, "warp-test", firstTraceValue(trace, "ip"))
 	return trace, nil
+}
+
+// warpConfigured reports whether anything currently routes through WARP: the
+// global default, an upstream override, or a single tunnel override.
+func (a *App) warpConfigured(cfg Settings) (bool, error) {
+	if cfg.V4Warp {
+		return true, nil
+	}
+	upstreams, err := a.store.Upstreams()
+	if err != nil {
+		return false, err
+	}
+	byID := upstreamsByID(upstreams)
+	for _, upstream := range upstreams {
+		if upstreamV4Mode(cfg, upstream) == V4ModeWarp {
+			return true, nil
+		}
+	}
+	tunnels, err := a.store.Tunnels()
+	if err != nil {
+		return false, err
+	}
+	for _, tunnel := range tunnels {
+		if resolvedV4Mode(cfg, byID, tunnel) == V4ModeWarp {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func firstTraceValue(trace, key string) string {

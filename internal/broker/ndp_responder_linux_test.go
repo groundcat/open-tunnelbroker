@@ -23,8 +23,8 @@ func TestResponderAnswersConcurrentlyWithMembershipChanges(t *testing.T) {
 	}
 	router := netip.MustParseAddr("2001:db8:1200:416::1")
 	client := netip.MustParseAddr("2001:db8:1200:416:1::5")
-	cfg := Settings{UpstreamV6: "2001:db8:1200:416::/64", UpstreamMode: UpstreamOnLink}
-	populated := ndpProxySetFor(cfg, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
+	upstream := Upstream{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Mode: UpstreamOnLink}
+	populated := ndpProxySetFor(upstream, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
 	responder.current.Store(&populated)
 
 	frame := solicitationFrame(t, router, client, "52:54:00:11:22:33")
@@ -90,8 +90,8 @@ func TestResponderIgnoresItsOwnFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Settings{UpstreamV6: "2001:db8:1200:416::/64", UpstreamMode: UpstreamOnLink}
-	set := ndpProxySetFor(cfg, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
+	upstream := Upstream{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Mode: UpstreamOnLink}
+	set := ndpProxySetFor(upstream, []Tunnel{{ID: 1, V6CIDR: "2001:db8:1200:416::/64", Enabled: true}}, nil)
 	responder.current.Store(&set)
 
 	// A frame whose source is this host's own Ethernet address must never be

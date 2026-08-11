@@ -260,7 +260,78 @@ func buildNeighborAdvertisementFrame(solicitation neighborSolicitation, hardware
 	return frame, nil
 }
 
-// upstreamLocalAddresses reports the IPv6 addresses configured on the upstream
+// ndpProxyManager keeps one responder per egress interface, because several
+// unrelated upstreams may each place their prefix on-link on a different
+// provider connection. Interfaces that no longer proxy anything are stopped.
+type ndpProxyManager struct {
+	logger *log.Logger
+
+	mu         sync.Mutex
+	responders map[string]*ndpResponder
+}
+
+func newNDPProxyManager(logger *log.Logger) *ndpProxyManager {
+	return &ndpProxyManager{logger: logger, responders: map[string]*ndpResponder{}}
+}
+
+// Configure reconciles the running listeners with the desired per-interface
+// address sets. It is safe to call on every reconciliation.
+func (m *ndpProxyManager) Configure(sets map[string]ndpProxySet) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var firstErr error
+	for name, responder := range m.responders {
+		if set, ok := sets[name]; !ok || set.empty() {
+			responder.Close()
+			delete(m.responders, name)
+		}
+	}
+	for name, set := range sets {
+		if set.empty() || name == "" {
+			continue
+		}
+		responder, ok := m.responders[name]
+		if !ok {
+			responder = newNDPResponder(m.logger)
+			m.responders[name] = responder
+		}
+		if err := responder.Configure(name, set); err != nil {
+			// One failing interface must not stop the others from being
+			// configured, so the first error is reported after the whole sweep.
+			if firstErr == nil {
+				firstErr = err
+			}
+			responder.Close()
+			delete(m.responders, name)
+		}
+	}
+	return firstErr
+}
+
+// Close stops every listener.
+func (m *ndpProxyManager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, responder := range m.responders {
+		responder.Close()
+		delete(m.responders, name)
+	}
+}
+
+// states reports the address set running on each interface, for drift checks.
+func (m *ndpProxyManager) states() map[string]ndpProxySet {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	running := make(map[string]ndpProxySet, len(m.responders))
+	for name, responder := range m.responders {
+		if _, set, up := responder.state(); up {
+			running[name] = set
+		}
+	}
+	return running
+}
+
+// upstreamLocalAddresses reports the IPv6 addresses configured on an egress
 // interface. They must never be proxied, because the kernel already answers for
 // them; in on-link mode the provider-assigned host address sits inside the
 // delegated prefix, so this is what keeps the host itself reachable.

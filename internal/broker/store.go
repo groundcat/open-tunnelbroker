@@ -35,11 +35,13 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), upstream_v6 TEXT NOT NULL DEFAULT '', upstream_v4 TEXT NOT NULL DEFAULT '', v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, interface_name TEXT NOT NULL DEFAULT 'wg0', server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, upstream_interface TEXT NOT NULL DEFAULT 'ppp0', inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated', upstream_mode TEXT NOT NULL DEFAULT 'routed', transport_address TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), v4_nat INTEGER NOT NULL DEFAULT 0, v4_warp INTEGER NOT NULL DEFAULT 0, v4_pool TEXT NOT NULL DEFAULT '10.99.0.0/16', default_dns TEXT NOT NULL DEFAULT '2606:4700:4700::1111', inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated');
 INSERT OR IGNORE INTO settings(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS upstreams (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, v6_cidr TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'routed', public_v4 TEXT NOT NULL DEFAULT '', egress_interface TEXT NOT NULL DEFAULT '', interface_name TEXT NOT NULL UNIQUE, endpoint_host TEXT NOT NULL DEFAULT '', endpoint_port INTEGER NOT NULL DEFAULT 51820, server_address TEXT NOT NULL DEFAULT '', server_private_key TEXT NOT NULL DEFAULT '', transport_address TEXT NOT NULL DEFAULT '', mtu INTEGER NOT NULL DEFAULT 1420, keepalive INTEGER NOT NULL DEFAULT 25, min_prefix INTEGER NOT NULL DEFAULT 48, max_prefix INTEGER NOT NULL DEFAULT 64, default_prefix INTEGER NOT NULL DEFAULT 56, v4_mode TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS warp_account (id INTEGER PRIMARY KEY CHECK(id=1), private_key TEXT NOT NULL, peer_public_key TEXT NOT NULL, ipv4_address TEXT NOT NULL, endpoint TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', account_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_trace TEXT NOT NULL DEFAULT '', last_test_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash BLOB NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS tunnels (id INTEGER PRIMARY KEY, interface_id INTEGER NOT NULL DEFAULT 1, label TEXT NOT NULL, public_key TEXT NOT NULL UNIQUE, preshared_key TEXT NOT NULL DEFAULT '', private_key TEXT NOT NULL DEFAULT '', allocated_v6_cidr TEXT NOT NULL UNIQUE, allocated_v4_internal TEXT UNIQUE, v4_enabled INTEGER NOT NULL DEFAULT 0, dns_override TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, mtu_override INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', last_error TEXT NOT NULL DEFAULT '', last_handshake TEXT NOT NULL DEFAULT '', rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tunnels (id INTEGER PRIMARY KEY, upstream_id INTEGER NOT NULL DEFAULT 0, label TEXT NOT NULL, public_key TEXT NOT NULL UNIQUE, preshared_key TEXT NOT NULL DEFAULT '', private_key TEXT NOT NULL DEFAULT '', allocated_v6_cidr TEXT NOT NULL UNIQUE, allocated_v4_internal TEXT UNIQUE, v4_enabled INTEGER NOT NULL DEFAULT 0, v4_mode TEXT NOT NULL DEFAULT '', quota_gib INTEGER NOT NULL DEFAULT 100, quota_used_bytes INTEGER NOT NULL DEFAULT 0, quota_period TEXT NOT NULL DEFAULT '', quota_disabled INTEGER NOT NULL DEFAULT 0, dns_override TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, mtu_override INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', last_error TEXT NOT NULL DEFAULT '', last_handshake TEXT NOT NULL DEFAULT '', rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS tunnels_upstream ON tunnels(upstream_id);
 CREATE TABLE IF NOT EXISTS routing_groups (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tunnel_routing_groups (tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE, group_id INTEGER NOT NULL REFERENCES routing_groups(id) ON DELETE CASCADE, PRIMARY KEY(tunnel_id,group_id));
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY, admin TEXT NOT NULL, action TEXT NOT NULL, tunnel_id INTEGER, detail TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -50,6 +52,7 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 	}
 	for _, migration := range []string{
 		`ALTER TABLE settings ADD COLUMN v4_warp INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE settings ADD COLUMN inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated'`,
 		`ALTER TABLE tunnels ADD COLUMN last_handshake TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN rx_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN tx_bytes INTEGER NOT NULL DEFAULT 0`,
@@ -58,37 +61,114 @@ CREATE INDEX IF NOT EXISTS audit_created ON audit_log(created_at);
 		`ALTER TABLE tunnels ADD COLUMN quota_used_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tunnels ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tunnels ADD COLUMN quota_disabled INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE settings ADD COLUMN inter_tunnel_policy TEXT NOT NULL DEFAULT 'isolated'`,
-		`ALTER TABLE settings ADD COLUMN upstream_mode TEXT NOT NULL DEFAULT 'routed'`,
-		`ALTER TABLE settings ADD COLUMN transport_address TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tunnels ADD COLUMN upstream_id INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, e := s.db.Exec(migration); e != nil && !strings.Contains(e.Error(), "duplicate column") {
 			return e
 		}
 	}
-	return s.migrateLegacyRoutingGroups()
+	if err = s.migrateLegacyRoutingGroups(); err != nil {
+		return err
+	}
+	return s.migrateLegacyUpstream()
 }
 
-func (s *Store) migrateLegacyRoutingGroups() error {
-	rows, err := s.db.Query(`PRAGMA table_info(tunnels)`)
+func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
+}
+
+// migrateLegacyUpstream converts a database that predates multiple upstreams,
+// where the single provider connection lived in the settings row. The values are
+// copied verbatim into one upstream and every existing tunnel is attached to it,
+// so an upgrade keeps the exact addressing, keys, and delegation mode a running
+// deployment already serves.
+func (s *Store) migrateLegacyUpstream() error {
+	columns, err := s.tableColumns("settings")
 	if err != nil {
 		return err
 	}
-	hasLegacyColumn := false
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue any
-		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			rows.Close()
-			return err
-		}
-		hasLegacyColumn = hasLegacyColumn || name == "routing_group"
+	if !columns["upstream_v6"] {
+		return nil
 	}
-	if err = rows.Close(); err != nil {
+	var existing int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM upstreams`).Scan(&existing); err != nil {
 		return err
 	}
-	if !hasLegacyColumn {
+	if existing > 0 {
+		return nil
+	}
+	legacy := Upstream{Name: "primary", Mode: UpstreamRouted}
+	// Delegation modes were added after the original single-upstream schema, so
+	// a database predating them has neither column. Selecting them
+	// unconditionally would fail to prepare and lose the whole upstream, which
+	// is why the query is built from the columns that actually exist.
+	query := `SELECT upstream_v6,upstream_v4,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface`
+	targets := []any{&legacy.V6CIDR, &legacy.PublicV4, &legacy.EndpointHost, &legacy.EndpointPort, &legacy.InterfaceName, &legacy.ServerAddress, &legacy.ServerPrivateKey, &legacy.MTU, &legacy.Keepalive, &legacy.MinPrefix, &legacy.MaxPrefix, &legacy.DefaultPrefix, &legacy.EgressInterface}
+	if columns["upstream_mode"] {
+		query += `,COALESCE(upstream_mode,'routed')`
+		targets = append(targets, &legacy.Mode)
+	}
+	if columns["transport_address"] {
+		query += `,COALESCE(transport_address,'')`
+		targets = append(targets, &legacy.TransportAddress)
+	}
+	if err = s.db.QueryRow(query + ` FROM settings WHERE id=1`).Scan(targets...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if strings.TrimSpace(legacy.V6CIDR) == "" {
+		return nil
+	}
+	if legacy.InterfaceName == "" {
+		legacy.InterfaceName = "wg0"
+	}
+	if !validUpstreamMode(legacy.Mode) {
+		legacy.Mode = UpstreamRouted
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT INTO upstreams(name,v6_cidr,mode,public_v4,egress_interface,interface_name,endpoint_host,endpoint_port,server_address,server_private_key,transport_address,mtu,keepalive,min_prefix,max_prefix,default_prefix,v4_mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',?,?)`, legacy.Name, legacy.V6CIDR, legacy.Mode, legacy.PublicV4, legacy.EgressInterface, legacy.InterfaceName, legacy.EndpointHost, legacy.EndpointPort, legacy.ServerAddress, legacy.ServerPrivateKey, legacy.TransportAddress, legacy.MTU, legacy.Keepalive, legacy.MinPrefix, legacy.MaxPrefix, legacy.DefaultPrefix, now, now)
+	if err != nil {
+		return err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE tunnels SET upstream_id=? WHERE upstream_id=0`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES('system','upstream-migrate',NULL,?,?)`, fmt.Sprintf("converted single upstream %s to upstream %q", legacy.V6CIDR, legacy.Name), now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateLegacyRoutingGroups() error {
+	columns, err := s.tableColumns("tunnels")
+	if err != nil {
+		return err
+	}
+	if !columns["routing_group"] {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -111,12 +191,10 @@ func (s *Store) migrateLegacyRoutingGroups() error {
 
 func (s *Store) Settings() (Settings, error) {
 	var v Settings
-	err := s.db.QueryRow(`SELECT upstream_v6,upstream_v4,v4_nat,v4_warp,v4_pool,default_dns,endpoint_host,endpoint_port,interface_name,server_address,server_private_key,mtu,keepalive,min_prefix,max_prefix,default_prefix,upstream_interface,inter_tunnel_policy,upstream_mode,transport_address FROM settings WHERE id=1`).Scan(&v.UpstreamV6, &v.UpstreamV4, &v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.EndpointHost, &v.EndpointPort, &v.InterfaceName, &v.ServerAddress, &v.ServerPrivateKey, &v.MTU, &v.Keepalive, &v.MinPrefix, &v.MaxPrefix, &v.DefaultPrefix, &v.UpstreamInterface, &v.InterTunnelPolicy, &v.UpstreamMode, &v.TransportAddress)
-	if err == nil && !validUpstreamMode(v.UpstreamMode) {
-		v.UpstreamMode = UpstreamRouted
-	}
+	err := s.db.QueryRow(`SELECT v4_nat,v4_warp,v4_pool,default_dns,inter_tunnel_policy FROM settings WHERE id=1`).Scan(&v.V4NAT, &v.V4Warp, &v.V4Pool, &v.DefaultDNS, &v.InterTunnelPolicy)
 	return v, err
 }
+
 func (s *Store) SaveSettings(v Settings) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -128,11 +206,180 @@ func (s *Store) SaveSettings(v Settings) error {
 		if parseErr != nil {
 			return parseErr
 		}
-		if err = ensureIPv4AllocationsTxForModes(tx, pool, v); err != nil {
+		upstreams, upstreamErr := upstreamsTx(tx)
+		if upstreamErr != nil {
+			return upstreamErr
+		}
+		if err = ensureIPv4AllocationsTx(tx, pool, v, upstreams); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.Exec(`UPDATE settings SET upstream_v6=?,upstream_v4=?,v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,endpoint_host=?,endpoint_port=?,interface_name=?,server_address=?,server_private_key=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,upstream_interface=?,inter_tunnel_policy=?,upstream_mode=?,transport_address=? WHERE id=1`, v.UpstreamV6, v.UpstreamV4, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.EndpointHost, v.EndpointPort, v.InterfaceName, v.ServerAddress, v.ServerPrivateKey, v.MTU, v.Keepalive, v.MinPrefix, v.MaxPrefix, v.DefaultPrefix, v.UpstreamInterface, v.InterTunnelPolicy, upstreamMode(v), v.TransportAddress); err != nil {
+	if _, err = tx.Exec(`UPDATE settings SET v4_nat=?,v4_warp=?,v4_pool=?,default_dns=?,inter_tunnel_policy=? WHERE id=1`, v.V4NAT, v.V4Warp, v.V4Pool, v.DefaultDNS, v.InterTunnelPolicy); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+const upstreamCols = `id,name,v6_cidr,mode,public_v4,egress_interface,interface_name,endpoint_host,endpoint_port,server_address,server_private_key,transport_address,mtu,keepalive,min_prefix,max_prefix,default_prefix,v4_mode,created_at,updated_at`
+
+func scanUpstream(scanner interface{ Scan(...any) error }) (Upstream, error) {
+	var u Upstream
+	var created, updated string
+	err := scanner.Scan(&u.ID, &u.Name, &u.V6CIDR, &u.Mode, &u.PublicV4, &u.EgressInterface, &u.InterfaceName, &u.EndpointHost, &u.EndpointPort, &u.ServerAddress, &u.ServerPrivateKey, &u.TransportAddress, &u.MTU, &u.Keepalive, &u.MinPrefix, &u.MaxPrefix, &u.DefaultPrefix, &u.V4Mode, &created, &updated)
+	if err == nil {
+		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if !validUpstreamMode(u.Mode) {
+			u.Mode = UpstreamRouted
+		}
+	}
+	return u, err
+}
+
+func upstreamsTx(tx *sql.Tx) ([]Upstream, error) {
+	rows, err := tx.Query(`SELECT ` + upstreamCols + ` FROM upstreams ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Upstream
+	for rows.Next() {
+		upstream, scanErr := scanUpstream(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, upstream)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Upstreams() ([]Upstream, error) {
+	rows, err := s.db.Query(`SELECT ` + upstreamCols + ` FROM upstreams ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Upstream
+	for rows.Next() {
+		upstream, scanErr := scanUpstream(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, upstream)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	counts, err := s.tunnelCountsByUpstream()
+	if err != nil {
+		return nil, err
+	}
+	for index := range out {
+		out[index].TunnelCount = counts[out[index].ID]
+	}
+	return out, nil
+}
+
+func (s *Store) tunnelCountsByUpstream() (map[int64]int, error) {
+	rows, err := s.db.Query(`SELECT upstream_id,COUNT(*) FROM tunnels GROUP BY upstream_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[int64]int)
+	for rows.Next() {
+		var id int64
+		var count int
+		if err = rows.Scan(&id, &count); err != nil {
+			return nil, err
+		}
+		counts[id] = count
+	}
+	return counts, rows.Err()
+}
+
+func (s *Store) Upstream(id int64) (Upstream, error) {
+	upstream, err := scanUpstream(s.db.QueryRow(`SELECT `+upstreamCols+` FROM upstreams WHERE id=?`, id))
+	if err != nil {
+		return upstream, err
+	}
+	counts, err := s.tunnelCountsByUpstream()
+	if err != nil {
+		return upstream, err
+	}
+	upstream.TunnelCount = counts[upstream.ID]
+	return upstream, nil
+}
+
+func (s *Store) InsertUpstream(u *Upstream, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT INTO upstreams(name,v6_cidr,mode,public_v4,egress_interface,interface_name,endpoint_host,endpoint_port,server_address,server_private_key,transport_address,mtu,keepalive,min_prefix,max_prefix,default_prefix,v4_mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, u.Name, u.V6CIDR, u.Mode, u.PublicV4, u.EgressInterface, u.InterfaceName, u.EndpointHost, u.EndpointPort, u.ServerAddress, u.ServerPrivateKey, u.TransportAddress, u.MTU, u.Keepalive, u.MinPrefix, u.MaxPrefix, u.DefaultPrefix, u.V4Mode, now, now)
+	if err != nil {
+		return translateUpstreamConflict(err)
+	}
+	u.ID, _ = result.LastInsertId()
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'upstream-create',NULL,?,?)`, admin, u.Name+" "+u.V6CIDR, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) UpdateUpstream(u Upstream, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE upstreams SET name=?,v6_cidr=?,mode=?,public_v4=?,egress_interface=?,interface_name=?,endpoint_host=?,endpoint_port=?,server_address=?,server_private_key=?,transport_address=?,mtu=?,keepalive=?,min_prefix=?,max_prefix=?,default_prefix=?,v4_mode=?,updated_at=? WHERE id=?`, u.Name, u.V6CIDR, u.Mode, u.PublicV4, u.EgressInterface, u.InterfaceName, u.EndpointHost, u.EndpointPort, u.ServerAddress, u.ServerPrivateKey, u.TransportAddress, u.MTU, u.Keepalive, u.MinPrefix, u.MaxPrefix, u.DefaultPrefix, u.V4Mode, now, u.ID); err != nil {
+		return translateUpstreamConflict(err)
+	}
+	if _, err = tx.Exec(`UPDATE tunnels SET status='pending',updated_at=? WHERE upstream_id=?`, now, u.ID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'upstream-update',NULL,?,?)`, admin, u.Name+" "+u.V6CIDR, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func translateUpstreamConflict(err error) error {
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		return err
+	}
+	if strings.Contains(err.Error(), "interface_name") {
+		return errors.New("another upstream already uses that WireGuard interface name")
+	}
+	return errors.New("another upstream already uses that name")
+}
+
+func (s *Store) DeleteUpstream(id int64, admin string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var name string
+	if err = tx.QueryRow(`SELECT name FROM upstreams WHERE id=?`, id).Scan(&name); err != nil {
+		return err
+	}
+	var tunnels int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM tunnels WHERE upstream_id=?`, id).Scan(&tunnels); err != nil {
+		return err
+	}
+	if tunnels > 0 {
+		return fmt.Errorf("upstream %q still has %d tunnel(s); delete them first", name, tunnels)
+	}
+	if _, err = tx.Exec(`DELETE FROM upstreams WHERE id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO audit_log(admin,action,tunnel_id,detail,created_at) VALUES(?,'upstream-delete',NULL,?,?)`, admin, name, now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -148,26 +395,35 @@ func (s *Store) EnsureIPv4Allocations(cfg Settings) error {
 	if err != nil {
 		return err
 	}
-	if err = ensureIPv4AllocationsTxForModes(tx, pool, cfg); err != nil {
+	upstreams, err := upstreamsTx(tx)
+	if err != nil {
+		return err
+	}
+	if err = ensureIPv4AllocationsTx(tx, pool, cfg, upstreams); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func ensureIPv4AllocationsTxForModes(tx *sql.Tx, pool netip.Prefix, cfg Settings) error {
-	rows, err := tx.Query(`SELECT id,COALESCE(allocated_v4_internal,''),v4_mode FROM tunnels ORDER BY id`)
+// ensureIPv4AllocationsTx assigns an internal IPv4 address to every tunnel whose
+// effective egress mode needs one. The mode is resolved per upstream, so a
+// tunnel on an IPv4-less upstream is skipped rather than consuming a pool
+// address it can never use.
+func ensureIPv4AllocationsTx(tx *sql.Tx, pool netip.Prefix, cfg Settings, upstreams []Upstream) error {
+	rows, err := tx.Query(`SELECT id,upstream_id,COALESCE(allocated_v4_internal,''),v4_mode FROM tunnels ORDER BY id`)
 	if err != nil {
 		return err
 	}
 	type allocation struct {
 		id            int64
+		upstreamID    int64
 		address, mode string
 	}
 	var tunnels []allocation
 	used := make(map[netip.Addr]bool)
 	for rows.Next() {
 		var tunnel allocation
-		if err = rows.Scan(&tunnel.id, &tunnel.address, &tunnel.mode); err != nil {
+		if err = rows.Scan(&tunnel.id, &tunnel.upstreamID, &tunnel.address, &tunnel.mode); err != nil {
 			rows.Close()
 			return err
 		}
@@ -179,8 +435,12 @@ func ensureIPv4AllocationsTxForModes(tx *sql.Tx, pool netip.Prefix, cfg Settings
 	if err = rows.Close(); err != nil {
 		return err
 	}
+	byID := upstreamsByID(upstreams)
 	for _, tunnel := range tunnels {
-		if tunnelV4Mode(cfg, Tunnel{V4Mode: tunnel.mode}) == V4ModeOff || tunnel.address != "" {
+		upstream, known := byID[tunnel.upstreamID]
+		// A tunnel whose upstream is gone carries no traffic, so it must not
+		// consume a pool address it could never use.
+		if !known || tunnelV4Mode(cfg, upstream, Tunnel{V4Mode: tunnel.mode}) == V4ModeOff || tunnel.address != "" {
 			continue
 		}
 		next, ok := nextFreeIPv4(pool.Masked(), used)
@@ -237,7 +497,7 @@ func (s *Store) AddAudit(admin, action, detail string) error {
 func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	var t Tunnel
 	var created, updated, handshake string
-	err := scanner.Scan(&t.ID, &t.InterfaceID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
+	err := scanner.Scan(&t.ID, &t.UpstreamID, &t.Label, &t.PublicKey, &t.PresharedKey, &t.PrivateKey, &t.V6CIDR, &t.V4Address, &t.V4Enabled, &t.V4Mode, &t.QuotaGiB, &t.QuotaUsedBytes, &t.QuotaPeriod, &t.QuotaDisabled, &t.DNSOverride, &t.Enabled, &t.MTUOverride, &t.Status, &t.LastError, &handshake, &t.RXBytes, &t.TXBytes, &created, &updated)
 	if err == nil {
 		t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -246,10 +506,19 @@ func scanTunnel(scanner interface{ Scan(...any) error }) (Tunnel, error) {
 	return t, err
 }
 
-const tunnelCols = `id,interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
+const tunnelCols = `id,upstream_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,COALESCE(allocated_v4_internal,''),v4_enabled,v4_mode,quota_gib,quota_used_bytes,quota_period,quota_disabled,dns_override,enabled,mtu_override,status,last_error,last_handshake,rx_bytes,tx_bytes,created_at,updated_at`
 
 func (s *Store) Tunnels() ([]Tunnel, error) {
-	rows, err := s.db.Query(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY allocated_v6_cidr`)
+	return s.queryTunnels(`SELECT ` + tunnelCols + ` FROM tunnels ORDER BY upstream_id,allocated_v6_cidr`)
+}
+
+// TunnelsForUpstream lists the tunnels carved out of one upstream's prefix.
+func (s *Store) TunnelsForUpstream(upstreamID int64) ([]Tunnel, error) {
+	return s.queryTunnels(`SELECT `+tunnelCols+` FROM tunnels WHERE upstream_id=? ORDER BY allocated_v6_cidr`, upstreamID)
+}
+
+func (s *Store) queryTunnels(query string, args ...any) ([]Tunnel, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -274,6 +543,7 @@ func (s *Store) Tunnels() ([]Tunnel, error) {
 	}
 	return out, nil
 }
+
 func (s *Store) Tunnel(id int64) (Tunnel, error) {
 	tunnel, err := scanTunnel(s.db.QueryRow(`SELECT `+tunnelCols+` FROM tunnels WHERE id=?`, id))
 	if err != nil {
@@ -339,7 +609,7 @@ func (s *Store) InsertTunnel(t *Tunnel, admin string) error {
 		return e
 	}
 	defer tx.Rollback()
-	r, e := tx.Exec(`INSERT INTO tunnels(interface_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, 1, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
+	r, e := tx.Exec(`INSERT INTO tunnels(upstream_id,label,public_key,preshared_key,private_key,allocated_v6_cidr,allocated_v4_internal,v4_enabled,v4_mode,quota_gib,quota_period,dns_override,enabled,mtu_override,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, t.UpstreamID, t.Label, t.PublicKey, t.PresharedKey, t.PrivateKey, t.V6CIDR, nullable(t.V4Address), t.V4Enabled, t.V4Mode, t.QuotaGiB, t.QuotaPeriod, t.DNSOverride, t.Enabled, t.MTUOverride, now, now)
 	if e != nil {
 		return e
 	}
@@ -569,8 +839,11 @@ func (s *Store) DeleteRoutingGroup(id int64, admin string) error {
 	}
 	return tx.Commit()
 }
-func (s *Store) UsedPrefixes() ([]netip.Prefix, error) {
-	ts, e := s.Tunnels()
+
+// UsedPrefixes lists the allocations carved out of one upstream. Free space is
+// always rebuilt from these rows, so allocations can never drift.
+func (s *Store) UsedPrefixes(upstreamID int64) ([]netip.Prefix, error) {
+	ts, e := s.TunnelsForUpstream(upstreamID)
 	if e != nil {
 		return nil, e
 	}
