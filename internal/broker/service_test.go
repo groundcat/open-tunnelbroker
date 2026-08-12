@@ -89,6 +89,17 @@ func mustUpstream(t *testing.T, a *App) Upstream {
 	return upstreams[0]
 }
 
+// mustUpstreams returns every configured connection, for tests that need to
+// pick a specific one out of several.
+func mustUpstreams(t *testing.T, a *App) []Upstream {
+	t.Helper()
+	upstreams, err := a.store.Upstreams()
+	if err != nil {
+		t.Fatalf("reading upstreams failed: %v", err)
+	}
+	return upstreams
+}
+
 func TestCreateTunnelPersistsThenApplies(t *testing.T) {
 	a, kernel := testApp(t)
 	tunnel, err := a.CreateTunnel(CreateTunnelInput{Label: "one", Prefix: 56, GenerateKeys: true}, "admin")
@@ -212,10 +223,15 @@ func TestMonthlyQuotaHandlesWireGuardCounterReset(t *testing.T) {
 func TestTunnelCreateAndEditFormsExposeMonthlyQuota(t *testing.T) {
 	a, _ := testApp(t)
 	managed := []RoutingGroup{{ID: 1, Name: "internal"}, {ID: 2, Name: "production"}}
-	upstream := mustUpstream(t, a)
-	newRecorder := httptest.NewRecorder()
-	a.render(newRecorder, "new", view{Title: "New tunnel", Settings: mustSettings(t, a), Upstream: upstream, Upstreams: []upstreamView{{Upstream: upstream}}, Prefixes: []int{56}, RoutingGroups: managed})
-	if body := newRecorder.Body.String(); !containsAll(body, `name="quota_gib"`, `value="100"`, `name="routing_groups"`, `multiple`, "Monthly upload + download quota") {
+	for _, group := range managed {
+		if err := a.CreateRoutingGroup(group.Name, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The form's defaults are supplied by the handler, so the page is fetched
+	// rather than rendered from a hand-built view.
+	body := get(t, a.newTunnel, "/tunnels/new").Body.String()
+	if !containsAll(body, `name="quota_gib"`, `value="100"`, `name="routing_groups"`, `multiple`, "Monthly upload + download quota") {
 		t.Fatalf("new tunnel quota field is missing: %s", body)
 	}
 

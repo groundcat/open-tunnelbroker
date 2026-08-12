@@ -38,6 +38,7 @@ type view struct {
 	Upgrade                                                   UpgradeStatus
 	Prefixes                                                  []int
 	RoutingGroups                                             []RoutingGroup
+	Draft                                                     tunnelDraft
 	Editing                                                   bool
 }
 
@@ -486,6 +487,58 @@ func fields(r *http.Request, key string) []string {
 	return values
 }
 
+// tunnelDraft carries a half-filled new-tunnel form back to the browser, so
+// that re-selecting the upstream or correcting a rejected field does not
+// silently discard everything else the admin had already typed.
+type tunnelDraft struct {
+	Label, PublicKey, DNS, V4Mode string
+	Groups                        []string
+	Prefix                        int
+	QuotaGiB                      int64
+	Generate                      bool
+}
+
+func (d tunnelDraft) HasGroup(name string) bool {
+	for _, group := range d.Groups {
+		if group == name {
+			return true
+		}
+	}
+	return false
+}
+
+func draftFrom(r *http.Request, upstream Upstream) tunnelDraft {
+	draft := tunnelDraft{
+		Label: field(r, "label"), PublicKey: field(r, "public_key"), DNS: field(r, "dns"),
+		V4Mode: field(r, "v4_mode"), Groups: fields(r, "routing_groups"),
+		Prefix: intField(r, "prefix"), QuotaGiB: int64Field(r, "quota_gib"),
+		Generate: r.FormValue("generate") != "",
+	}
+	// A size carried over from another upstream may lie outside this one's
+	// limits, in which case its own default is the only sensible offer.
+	if draft.Prefix < upstream.MinPrefix || draft.Prefix > upstream.MaxPrefix {
+		draft.Prefix = upstream.DefaultPrefix
+	}
+	if draft.QuotaGiB <= 0 {
+		draft.QuotaGiB = 100
+	}
+	return draft
+}
+
+// chooseUpstream resolves the posted selection against the configured
+// connections, falling back to the first only when nothing was chosen.
+func chooseUpstream(upstreams []upstreamView, selected int64) Upstream {
+	for _, upstream := range upstreams {
+		if upstream.ID == selected {
+			return upstream.Upstream
+		}
+	}
+	if selected == 0 && len(upstreams) > 0 {
+		return upstreams[0].Upstream
+	}
+	return Upstream{}
+}
+
 func (a *App) newTunnel(w http.ResponseWriter, r *http.Request) {
 	v := a.base(r)
 	v.Title = "New tunnel"
@@ -496,24 +549,30 @@ func (a *App) newTunnel(w http.ResponseWriter, r *http.Request) {
 		v.Error = err.Error()
 	}
 	v.Upstreams = upstreams
-	// The prefix menu belongs to one upstream, so it is offered for the
-	// selected connection, defaulting to the first when none was chosen yet.
+	// The upstream travels in the same form as the rest of the tunnel, so the
+	// allocation is made from whichever connection the admin actually chose.
+	// The chosen one also decides which allocation sizes the prefix menu can
+	// offer, since those limits are configured per upstream.
 	selected := int64Field(r, "upstream_id")
-	for _, upstream := range upstreams {
-		if selected == 0 || upstream.ID == selected {
-			v.Upstream = upstream.Upstream
-			break
-		}
-	}
+	v.Upstream = chooseUpstream(upstreams, selected)
 	for i := v.Upstream.MinPrefix; i <= v.Upstream.MaxPrefix && v.Upstream.ID != 0; i++ {
 		v.Prefixes = append(v.Prefixes, i)
 	}
+	v.Draft = tunnelDraft{Prefix: v.Upstream.DefaultPrefix, QuotaGiB: 100, Generate: true}
 	if r.Method == "POST" {
 		if !a.checkCSRF(r) {
 			http.Error(w, "invalid CSRF token", 403)
 			return
 		}
-		t, e := a.CreateTunnel(CreateTunnelInput{UpstreamID: selected, Label: field(r, "label"), PublicKey: field(r, "public_key"), DNS: field(r, "dns"), V4Mode: field(r, "v4_mode"), RoutingGroups: fields(r, "routing_groups"), Prefix: intField(r, "prefix"), QuotaGiB: int64Field(r, "quota_gib"), GenerateKeys: r.FormValue("generate") != ""}, v.User)
+		v.Draft = draftFrom(r, v.Upstream)
+		// Re-selecting the upstream only reloads the sizes it offers. It is a
+		// submission of the same form rather than a scripted reload, because
+		// the page's Content-Security-Policy forbids inline scripts.
+		if field(r, "action") == "select" {
+			a.render(w, "new", v)
+			return
+		}
+		t, e := a.CreateTunnel(CreateTunnelInput{UpstreamID: selected, Label: v.Draft.Label, PublicKey: v.Draft.PublicKey, DNS: v.Draft.DNS, V4Mode: v.Draft.V4Mode, RoutingGroups: v.Draft.Groups, Prefix: v.Draft.Prefix, QuotaGiB: v.Draft.QuotaGiB, GenerateKeys: v.Draft.Generate}, v.User)
 		if e != nil {
 			v.Error = e.Error()
 		} else {
@@ -687,5 +746,5 @@ const pageHTML = `{{define "head"}}<!doctype html><html lang="en"><head><meta ch
 {{define "routing"}}{{template "head" .}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Inter-tunnel routing policy</label><select name="inter_tunnel_policy"><option value="isolated" {{if eq .Settings.InterTunnelPolicy "isolated"}}selected{{end}}>Isolated (recommended default)</option><option value="groups" {{if eq .Settings.InterTunnelPolicy "groups"}}selected{{end}}>Shared managed group</option><option value="any" {{if eq .Settings.InterTunnelPolicy "any"}}selected{{end}}>Any tunnel</option></select><p class="muted"><strong>Isolated:</strong> blocks all tunnel-to-tunnel traffic. <strong>Shared managed group:</strong> permits traffic when two tunnels share at least one group. <strong>Any tunnel:</strong> permits all active tunnels to communicate. The policy applies across upstreams as well as within one, so tunnels from unrelated providers can reach each other. IPv4 and IPv6 source addresses are preserved; inter-tunnel traffic is never NATed.</p><p><button>Save and apply routing policy</button></p></form><h2>Routing-group assignments</h2><table><thead><tr><th>Tunnel</th><th>Upstream</th><th>Groups</th><th>State</th></tr></thead><tbody>{{range .Tunnels}}<tr><td><a href="/tunnels/{{.ID}}">{{.Label}}</a></td><td>{{upstreamName $.UpstreamNames .UpstreamID}}</td><td>{{range .RoutingGroups}}<span class="tag">{{.}}</span>{{else}}<span class="muted">none</span>{{end}}</td><td>{{if .Enabled}}active{{else}}disabled{{end}}</td></tr>{{else}}<tr><td colspan="4">No tunnels yet.</td></tr>{{end}}</tbody></table>{{template "foot" .}}{{end}}
 {{define "upgrade"}}{{template "head" .}}<p><strong>Repository:</strong> {{if .Upgrade.Repository}}{{.Upgrade.Repository}}{{else}}not configured{{end}}<br><strong>Remote:</strong> {{.Upgrade.Remote}}<br><strong>Branch:</strong> {{.Upgrade.Branch}}<br><strong>Current revision:</strong> {{.Upgrade.Revision}}<br><strong>Last upgrade:</strong> {{.Upgrade.State}}{{if .Upgrade.Detail}} — {{.Upgrade.Detail}}{{end}}</p>{{if .Upgrade.Available}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><p>The upgrade service will require a clean checkout, fetch and fast-forward the current branch from <code>origin</code>, run all tests, build and atomically install the binary, then restart the application.</p><button>Pull, test, and deploy latest</button></form>{{else}}<p class="error">Self-upgrade is unavailable. Configure the deployment checkout and systemd upgrade unit.</p>{{end}}{{template "foot" .}}{{end}}
 {{define "settings"}}{{template "head" .}}<p class="muted">These preferences apply to the whole deployment. Provider connections, delegated prefixes, and WireGuard interfaces are configured per upstream on the <a href="/upstreams">Upstreams</a> page.</p><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="row"><div><h2>Clients</h2><label>Default DNS</label><input name="default_dns" value="{{.Settings.DefaultDNS}}"><label>Default IPv4 egress mode</label><select name="v4_mode"><option value="off" {{if and (not .Settings.V4NAT) (not .Settings.V4Warp)}}selected{{end}}>Disabled</option><option value="native" {{if .Settings.V4NAT}}selected{{end}}>Native upstream NAT</option><option value="warp" {{if .Settings.V4Warp}}selected{{end}}>Cloudflare WARP NAT</option></select><p class="muted">Native NAT masquerades a tunnel through the egress interface of its own upstream. Any upstream or tunnel may override this default.</p><label>Internal IPv4 pool</label><input name="v4_pool" value="{{.Settings.V4Pool}}"><p class="muted">One pool serves every upstream; addresses are unique across the deployment.</p></div><div><h2>Configured upstreams</h2>{{range .Upstreams}}<p>{{.Name}} — {{.V6CIDR}} via {{.EgressInterface}} ({{.EffectiveV4Mode}})</p>{{else}}<p class="error">No upstream is configured. <a href="/upstreams/new">Add one</a>.</p>{{end}}</div></div><p><button>Save and apply</button></p></form><h2>Cloudflare WARP account</h2>{{if .Warp.Exists}}<p>Account: {{if .Warp.AccountID}}{{.Warp.AccountID}}{{else}}registered{{end}}<br>Type: {{.Warp.AccountType}}<br>WARP IPv4: {{.Warp.IPv4Address}}<br>Endpoint: {{.Warp.Endpoint}}<br>Created: {{since .Warp.CreatedAt}}</p>{{else}}<p>No WARP account is registered. Create one before selecting Cloudflare WARP NAT.</p>{{end}}<p class="muted">Creating an account contacts Cloudflare's WARP registration API and records acceptance of its terms at the current time. One account serves every upstream that selects WARP egress.</p><form method="post" action="/warp"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="register"><button>{{if .Warp.Exists}}Recreate{{else}}Create{{end}} WARP account</button></form>{{if .Warp.Exists}}<form method="post" action="/warp"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="test"><button>Test WARP outbound IP</button></form>{{end}}{{if .Warp.LastTrace}}<h3>Last WARP trace</h3><p class="muted">Tested {{since .Warp.LastTestAt}}</p><pre>{{.Warp.LastTrace}}</pre>{{end}}<h2>Reset general settings</h2><p>Restores the default IPv4 mode, address pool, DNS, and inter-tunnel policy. Upstreams, their prefixes, interfaces, and keys are preserved, because those describe the deployment rather than a preference.</p><form method="post" action="/settings/reset"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Reset general settings to defaults</button></form>{{template "foot" .}}{{end}}
-{{define "new"}}{{template "head" .}}{{if not .Upstreams}}<p class="error">No upstream is configured. <a href="/upstreams/new">Add an upstream</a> before creating tunnels.</p>{{else}}<form method="get"><label>Upstream</label><select name="upstream_id" onchange="this.form.submit()">{{range .Upstreams}}<option value="{{.ID}}" {{if eq .ID $.Upstream.ID}}selected{{end}}>{{.Name}} — {{.V6CIDR}}</option>{{end}}</select><noscript><button>Select upstream</button></noscript></form><p class="muted">The tunnel is allocated from this upstream's prefix and egresses through {{.Upstream.EgressInterface}}. Changing the selection reloads the allocation sizes it offers.</p><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="upstream_id" value="{{.Upstream.ID}}"><label>Label</label><input name="label" required><label>Allocation size</label><select name="prefix">{{range .Prefixes}}<option value="{{.}}" {{if eq . $.Upstream.DefaultPrefix}}selected{{end}}>/{{.}}</option>{{end}}</select><label><input type="checkbox" name="generate" checked> Generate client keypair (private key is stored and shown to the admin)</label><label>Client public key (uncheck generate to use)</label><input name="public_key"><label>DNS override</label><input name="dns" placeholder="{{.Settings.DefaultDNS}}"><label>IPv4 egress mode</label><select name="v4_mode"><option value="" selected>Use upstream default</option><option value="off">Disabled</option><option value="native">Native NAT through this upstream</option><option value="warp">Cloudflare WARP NAT</option></select><p class="muted">The upstream's setting remains the default unless this tunnel overrides it.</p><label>Routing groups</label>{{if .RoutingGroups}}<select name="routing_groups" multiple>{{range .RoutingGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select><p class="muted">Select zero, one, or multiple groups. Use Ctrl/Cmd to select several.</p>{{else}}<p class="muted">No managed groups exist. <a href="/groups">Create a routing group</a> first, or leave this tunnel isolated.</p>{{end}}<label>Monthly upload + download quota (GiB)</label><input type="number" name="quota_gib" value="100" min="1" required><p class="muted">Usage resets on the first day of each calendar month (UTC).</p><p><button>Create and apply</button></p></form>{{end}}{{template "foot" .}}{{end}}
+{{define "new"}}{{template "head" .}}{{if not .Upstreams}}<p class="error">No upstream is configured. <a href="/upstreams/new">Add an upstream</a> before creating tunnels.</p>{{else}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Upstream</label><select name="upstream_id">{{range .Upstreams}}<option value="{{.ID}}" {{if eq .ID $.Upstream.ID}}selected{{end}}>{{.Name}} &mdash; {{.V6CIDR}}</option>{{end}}</select><p class="muted">The tunnel is allocated from this upstream's prefix and egresses through {{.Upstream.EgressInterface}}. If you change the selection, reload the allocation sizes it offers before creating the tunnel.</p><p><button name="action" value="select">Reload sizes for this upstream</button></p><label>Label</label><input name="label" value="{{.Draft.Label}}" required><label>Allocation size</label><select name="prefix">{{range .Prefixes}}<option value="{{.}}" {{if eq . $.Draft.Prefix}}selected{{end}}>/{{.}}</option>{{end}}</select><label><input type="checkbox" name="generate" {{if .Draft.Generate}}checked{{end}}> Generate client keypair (private key is stored and shown to the admin)</label><label>Client public key (uncheck generate to use)</label><input name="public_key" value="{{.Draft.PublicKey}}"><label>DNS override</label><input name="dns" value="{{.Draft.DNS}}" placeholder="{{.Settings.DefaultDNS}}"><label>IPv4 egress mode</label><select name="v4_mode"><option value="" {{if eq .Draft.V4Mode ""}}selected{{end}}>Use upstream default</option><option value="off" {{if eq .Draft.V4Mode "off"}}selected{{end}}>Disabled</option><option value="native" {{if eq .Draft.V4Mode "native"}}selected{{end}}>Native NAT through this upstream</option><option value="warp" {{if eq .Draft.V4Mode "warp"}}selected{{end}}>Cloudflare WARP NAT</option></select><p class="muted">The upstream's setting remains the default unless this tunnel overrides it.</p><label>Routing groups</label>{{if .RoutingGroups}}<select name="routing_groups" multiple>{{range .RoutingGroups}}<option value="{{.Name}}" {{if $.Draft.HasGroup .Name}}selected{{end}}>{{.Name}}</option>{{end}}</select><p class="muted">Select zero, one, or multiple groups. Use Ctrl/Cmd to select several.</p>{{else}}<p class="muted">No managed groups exist. <a href="/groups">Create a routing group</a> first, or leave this tunnel isolated.</p>{{end}}<label>Monthly upload + download quota (GiB)</label><input type="number" name="quota_gib" value="{{.Draft.QuotaGiB}}" min="1" required><p class="muted">Usage resets on the first day of each calendar month (UTC).</p><p><button name="action" value="create">Create and apply</button></p></form>{{end}}{{template "foot" .}}{{end}}
 {{define "detail"}}{{template "head" .}}<p><strong>Upstream:</strong> {{if .Upstream.ID}}<a href="/upstreams/{{.Upstream.ID}}">{{.Upstream.Name}}</a> ({{.Upstream.V6CIDR}} via {{.Upstream.EgressInterface}}){{else}}<span class="bad">unassigned</span>{{end}}<br><strong>IPv6 allocation:</strong> {{.Tunnel.V6CIDR}}<br><strong>IPv4:</strong> {{if ne .EffectiveV4Mode "off"}}{{.Tunnel.V4Address}} ({{.EffectiveV4Mode}}){{else}}disabled{{end}}<br><strong>Routing groups:</strong> {{range .Tunnel.RoutingGroups}}<span class="tag">{{.}}</span>{{else}}none{{end}}<br><strong>Monthly traffic:</strong> {{bytes .Tunnel.QuotaUsedBytes}} of {{.Tunnel.QuotaGiB}} GiB ({{.Tunnel.QuotaPeriod}})<br><strong>State:</strong> {{if .Tunnel.QuotaDisabled}}quota reached · {{else if not .Tunnel.Enabled}}disabled · {{end}}{{.Tunnel.Status}}{{if .Tunnel.LastError}} — <span class="bad">{{.Tunnel.LastError}}</span>{{end}}</p><div class="row"><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="v4-mode"><h2>IPv4 egress</h2><label>Mode for this tunnel</label><select name="v4_mode"><option value="" {{if eq .Tunnel.V4Mode ""}}selected{{end}}>Use upstream default</option><option value="off" {{if eq .Tunnel.V4Mode "off"}}selected{{end}}>Disabled</option><option value="native" {{if eq .Tunnel.V4Mode "native"}}selected{{end}}>Native NAT through this upstream</option><option value="warp" {{if eq .Tunnel.V4Mode "warp"}}selected{{end}}>Cloudflare WARP NAT</option></select><p class="muted">Effective mode: {{.EffectiveV4Mode}}.</p><p><button>Save and apply mode</button></p></form><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="routing-groups"><h2>Routing groups</h2>{{if .RoutingGroups}}<label>Managed groups</label><select name="routing_groups" multiple>{{range .RoutingGroups}}<option value="{{.Name}}" {{if $.Tunnel.HasRoutingGroup .Name}}selected{{end}}>{{.Name}}</option>{{end}}</select><p class="muted">Select zero, one, or multiple groups. Use Ctrl/Cmd to select several.</p><p><button>Save routing groups</button></p>{{else}}<p class="muted">No managed groups exist. <a href="/groups">Create one</a> to enable grouped routing.</p>{{end}}</form><form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="quota"><h2>Monthly quota</h2><label>Combined upload + download quota (GiB)</label><input type="number" name="quota_gib" value="{{.Tunnel.QuotaGiB}}" min="1" required><p class="muted">Resets automatically each calendar month (UTC).</p><p><button>Save quota</button></p></form></div><h2>Client configuration</h2><pre>{{.Config}}</pre>{{if .Tunnel.PrivateKey}}<h3>Scan configuration</h3><p><img src="/tunnels/{{.Tunnel.ID}}/qr.png" width="320" height="320" alt="QR code containing the WireGuard configuration"></p><p class="muted">The QR code contains the private key and full configuration. Treat it as sensitive.</p>{{else}}<p class="muted">QR code unavailable because the client private key remains client-side.</p>{{end}}<form method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="toggle"><button>{{if .Tunnel.Enabled}}Disable{{else}}Enable{{end}} tunnel</button></form><h2>Delete</h2><form method="post" class="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="delete"><p>Deletion immediately removes the peer and route and frees the allocation.</p><button>Delete tunnel</button></form>{{template "foot" .}}{{end}}`

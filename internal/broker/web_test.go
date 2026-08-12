@@ -3,6 +3,7 @@ package broker
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -99,6 +100,94 @@ func TestUpstreamPagesManageProviderConnections(t *testing.T) {
 	}
 	if reloaded, _ := app.store.Upstream(secondary.ID); reloaded.Name != "renamed" || reloaded.V4Mode != V4ModeOff {
 		t.Fatalf("upstream edit was not applied: %+v", reloaded)
+	}
+}
+
+// A tunnel must be allocated from the upstream the admin picked, whichever
+// position it happens to occupy in the menu. The selection used to travel in a
+// separate GET form submitted by an inline onchange handler, which the page's
+// own Content-Security-Policy blocks; the creation form then carried a hidden
+// field still holding the server's default, so every tunnel landed on the first
+// upstream by name regardless of what was chosen.
+func TestNewTunnelAllocatesFromTheSelectedUpstream(t *testing.T) {
+	app, _ := testApp(t)
+	// Named to sort before "primary", reproducing the deployment where the
+	// unintended upstream was the one that came first.
+	second := testUpstream()
+	second.Name = "AAA-other"
+	second.V6CIDR = "2001:db8:7700::/48"
+	second.ServerAddress = "2001:db8:7700::1/64"
+	second.InterfaceName = "wg-other"
+	second.EndpointPort = 51821
+	second.EgressInterface = "eth1"
+	other, err := app.CreateUpstream(second, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := mustUpstream(t, app)
+	if primary.Name != "AAA-other" {
+		t.Fatalf("expected the decoy upstream to sort first, got %q", primary.Name)
+	}
+	var wanted Upstream
+	for _, upstream := range mustUpstreams(t, app) {
+		if upstream.Name == "primary" {
+			wanted = upstream
+		}
+	}
+
+	// The whole form posts together, so the choice arrives with the tunnel.
+	created := post(t, app.newTunnel, "/tunnels/new", url.Values{
+		"upstream_id": {strconv.FormatInt(wanted.ID, 10)}, "action": {"create"},
+		"label": {"picked"}, "prefix": {"56"}, "generate": {"on"}, "quota_gib": {"100"},
+	})
+	if created.Code != http.StatusSeeOther {
+		t.Fatalf("creating a tunnel returned %d: %s", created.Code, created.Body.String())
+	}
+	tunnels, err := app.store.TunnelsForUpstream(wanted.ID)
+	if err != nil || len(tunnels) != 1 || tunnels[0].Label != "picked" {
+		t.Fatalf("tunnel was not allocated from the selected upstream: %+v, %v", tunnels, err)
+	}
+	if !netip.MustParsePrefix(wanted.V6CIDR).Contains(netip.MustParsePrefix(tunnels[0].V6CIDR).Addr()) {
+		t.Fatalf("allocation %s is outside the selected upstream %s", tunnels[0].V6CIDR, wanted.V6CIDR)
+	}
+	if stranded, _ := app.store.TunnelsForUpstream(other.ID); len(stranded) != 0 {
+		t.Fatalf("tunnel was allocated from the unselected upstream: %+v", stranded)
+	}
+}
+
+// Re-selecting the upstream reloads the sizes it offers without creating
+// anything, and keeps the fields the admin had already filled in.
+func TestNewTunnelUpstreamReselectionOnlyReloadsSizes(t *testing.T) {
+	app, _ := testApp(t)
+	narrow := testUpstream()
+	narrow.Name = "narrow"
+	narrow.V6CIDR = "2001:db8:7700::/48"
+	narrow.ServerAddress = "2001:db8:7700::1/64"
+	narrow.InterfaceName = "wg-narrow"
+	narrow.EndpointPort = 51821
+	narrow.MinPrefix, narrow.MaxPrefix, narrow.DefaultPrefix = 60, 62, 61
+	chosen, err := app.CreateUpstream(narrow, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := post(t, app.newTunnel, "/tunnels/new", url.Values{
+		"upstream_id": {strconv.FormatInt(chosen.ID, 10)}, "action": {"select"},
+		"label": {"typed already"}, "prefix": {"56"}, "quota_gib": {"250"},
+	})
+	body := reloaded.Body.String()
+	if reloaded.Code != http.StatusOK {
+		t.Fatalf("reselecting an upstream returned %d: %s", reloaded.Code, body)
+	}
+	// The sizes now come from the chosen upstream, and /56 is no longer offered.
+	if !containsAll(body, `value="60"`, `value="61" selected`, `value="62"`, `value="typed already"`, `value="250"`) {
+		t.Fatalf("reselection did not reload sizes or preserve the draft:\n%s", body)
+	}
+	if strings.Contains(body, `<option value="56"`) {
+		t.Fatalf("a size outside the chosen upstream's limits is still offered:\n%s", body)
+	}
+	if tunnels, _ := app.store.Tunnels(); len(tunnels) != 0 {
+		t.Fatalf("reselecting an upstream created a tunnel: %+v", tunnels)
 	}
 }
 
