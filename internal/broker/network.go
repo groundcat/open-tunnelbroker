@@ -500,17 +500,29 @@ func (k *LinuxKernel) ensureUpstreamTable(upstream Upstream) error {
 }
 
 // defaultGatewayVia reports the next hop the main table uses for one interface.
+//
+// A default route is not always a single-gateway route: some providers hand
+// out an ECMP default (multiple weighted nexthops, e.g. a documented gateway
+// alongside a link-local fallback), in which case the kernel reports the
+// gateway on each entry in Route.MultiPath rather than on Route.Gw itself.
+// Skipping those would leave a policy table's default route without a
+// gateway, which silently blackholes every packet sent through it.
 func defaultGatewayVia(linkIndex, family int) net.IP {
 	routes, err := netlink.RouteList(nil, family)
 	if err != nil {
 		return nil
 	}
 	for _, route := range routes {
-		if route.LinkIndex != linkIndex || route.Table != 254 || route.Gw == nil {
+		if route.Table != 254 || (route.Dst != nil && !isDefaultRoute(route.Dst)) {
 			continue
 		}
-		if route.Dst == nil || isDefaultRoute(route.Dst) {
+		if route.LinkIndex == linkIndex && route.Gw != nil {
 			return route.Gw
+		}
+		for _, hop := range route.MultiPath {
+			if hop != nil && hop.LinkIndex == linkIndex && hop.Gw != nil {
+				return hop.Gw
+			}
 		}
 	}
 	return nil
